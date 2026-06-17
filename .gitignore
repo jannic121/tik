@@ -1,0 +1,15 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local databases / state (catalog + control plane)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.tt-recorder/
+
+# Secrets / env
+*.secret
+.env
