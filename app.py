@@ -72,6 +72,13 @@ class Settings:
     # for this long (and isn't held open) — protects in-progress recordings,
     # especially once the recorder and storage are on separate machines.
     settle_sec: int       = int(os.environ.get("RECORDER_SETTLE_SEC", "120"))
+    # Orphaned-_flv reaper: finalize/clean up intermediate recordings whose
+    # recorder died before remux (the classic disk-filler). See _flv_reaper_loop.
+    reap_enabled: bool    = os.environ.get("FLV_REAP_ENABLED", "1") == "1"
+    reap_interval: int    = int(os.environ.get("FLV_REAP_INTERVAL_SEC", "600"))
+    # 0 = never delete a corrupt/un-remuxable orphan (quarantine it). >0 = delete
+    # corrupt orphans older than this many days (reclaims space, loses the file).
+    reap_delete_corrupt_days: float = float(os.environ.get("FLV_REAP_DELETE_CORRUPT_DAYS", "0"))
     state_file: Path = Path(os.environ.get("STATE_FILE", "/var/lib/tt-recorder/state.json"))
     max_watchers: int = int(os.environ.get("MAX_WATCHERS", "30"))
     # Max random delay (seconds) before a watcher's first spawn, so a mass
@@ -384,9 +391,15 @@ async def lifespan(app: FastAPI):
     settings.recordings_root.mkdir(parents=True, exist_ok=True)
     log.info("backend %s (region=%s) starting", settings.backend_id, settings.region)
     await manager.restore()
+    reaper_task = None
+    if settings.reap_enabled:
+        reaper_task = asyncio.create_task(_flv_reaper_loop(), name="flv-reaper")
+        log.info("orphan-_flv reaper enabled (every %ds)", settings.reap_interval)
     try:
         yield
     finally:
+        if reaper_task:
+            reaper_task.cancel()
         log.info("stopping all watchers gracefully...")
         await manager.stop_all()
 
@@ -552,6 +565,130 @@ def _in_progress(path: Path, now: float, open_files: set) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Orphaned-_flv reaper
+#
+# Michele0303 records to TK_<user>_<ts>_flv.mp4, then remuxes it to the final
+# TK_<user>_<ts>.mp4 on a clean stop. If the recorder is killed first (OOM,
+# reboot, crash) the _flv intermediate is orphaned and never cleaned up — and
+# app.py's /files deliberately hides _flv, so nothing else ever removes it. They
+# pile up and fill the disk. The reaper finalizes/cleans them, safely.
+
+_reap_stats: dict = {"last_run": None, "runs": 0,
+                     "redundant": 0, "salvaged": 0, "corrupt": 0, "freed_bytes": 0}
+
+_FLV_SUFFIX = "_flv.mp4"
+
+
+async def _remux_flv(flv: Path, final: Path) -> bool:
+    """Finalize an orphan _flv into its final .mp4 with a fast, lossless
+    stream-copy. Atomic (temp → rename); the source is kept until the final
+    verifies, so a failed remux can't lose a recording. Returns True on success."""
+    if shutil.which("ffmpeg") is None:
+        return False
+    tmp = final.with_name(final.name + ".remuxing")   # not *.mp4 → scanners ignore it
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", str(flv), "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await asyncio.wait_for(proc.wait(), timeout=900)
+    except Exception:
+        try: tmp.unlink()
+        except OSError: pass
+        return False
+    if rc == 0 and tmp.exists() and tmp.stat().st_size > 0:
+        try:
+            os.replace(tmp, final)
+            return True
+        except OSError:
+            pass
+    try: tmp.unlink()
+    except OSError: pass
+    return False
+
+
+async def _reap_flv_once() -> dict:
+    """One pass over RECORDINGS_ROOT. For each settled _flv NOT still being
+    recorded: delete it if the final already exists, else remux it to the final
+    and delete it. Corrupt/un-remuxable orphans are quarantined (left in place)
+    unless FLV_REAP_DELETE_CORRUPT_DAYS is set."""
+    root = settings.recordings_root
+    res = {"redundant": 0, "salvaged": 0, "corrupt": 0, "freed_bytes": 0, "skipped": 0}
+    if not root.exists():
+        return res
+    open_files = _open_files()
+    now = time.time()
+    for flv in root.rglob("*" + _FLV_SUFFIX):
+        if not flv.is_file():
+            continue
+        if _in_progress(flv, now, open_files):
+            res["skipped"] += 1
+            continue                       # still recording — never touch it
+        try:
+            size = flv.stat().st_size
+        except OSError:
+            continue
+        final = flv.with_name(flv.name[:-len(_FLV_SUFFIX)] + ".mp4")
+        final_ready = (final.exists() and final.stat().st_size > 0
+                       and not _in_progress(final, now, open_files))
+        try:
+            if final_ready:
+                flv.unlink()               # redundant leftover of a finished recording
+                res["redundant"] += 1
+                res["freed_bytes"] += size
+                log.info("reaper: removed redundant %s (final exists)", flv.name)
+            elif await _remux_flv(flv, final):
+                flv.unlink()               # orphan salvaged into a clean final
+                res["salvaged"] += 1
+                res["freed_bytes"] += size
+                log.info("reaper: salvaged orphan %s → %s", flv.name, final.name)
+            else:
+                res["corrupt"] += 1
+                days = settings.reap_delete_corrupt_days
+                if days > 0 and (now - flv.stat().st_mtime) > days * 86400:
+                    flv.unlink()
+                    res["freed_bytes"] += size
+                    log.warning("reaper: deleted corrupt orphan %s (older than %.1fd)",
+                                flv.name, days)
+                else:
+                    log.warning("reaper: %s won't remux — quarantined (corrupt/truncated)",
+                                flv.name)
+        except OSError as e:
+            log.warning("reaper: error handling %s: %s", flv.name, e)
+    return res
+
+
+async def _flv_reaper_loop() -> None:
+    """Run the reaper shortly after startup (catches reboot/OOM leftovers) then on
+    an interval. Disable with FLV_REAP_ENABLED=0."""
+    try:
+        await asyncio.sleep(30)            # let restore() settle first
+    except asyncio.CancelledError:
+        return
+    while True:
+        try:
+            r = await _reap_flv_once()
+            _reap_stats["last_run"] = time.time()
+            _reap_stats["runs"] += 1
+            for k in ("redundant", "salvaged", "corrupt", "freed_bytes"):
+                _reap_stats[k] += r[k]
+            if r["redundant"] or r["salvaged"] or r["corrupt"]:
+                log.info("reaper pass: %d redundant, %d salvaged, %d corrupt, %s freed",
+                         r["redundant"], r["salvaged"], r["corrupt"], f"{r['freed_bytes']:,}")
+        except Exception:
+            log.exception("flv reaper pass failed")
+        try:
+            await asyncio.sleep(settings.reap_interval)
+        except asyncio.CancelledError:
+            return
+
+
 @app.get("/files/chat", dependencies=[Depends(require_auth)])
 async def list_chat_files():
     """List completed chat logs (*_chat.jsonl) so the upload worker can ship them
@@ -607,6 +744,26 @@ async def list_files():
         if files:
             result[creator_dir.name] = files
     return result
+
+
+@app.get("/flv/status", dependencies=[Depends(require_auth)])
+async def flv_status():
+    """Orphan-_flv reaper telemetry: cumulative counts since start + last run."""
+    return {**_reap_stats, "enabled": settings.reap_enabled,
+            "interval_sec": settings.reap_interval,
+            "delete_corrupt_days": settings.reap_delete_corrupt_days}
+
+
+@app.post("/flv/reap-now", dependencies=[Depends(require_auth)])
+async def flv_reap_now():
+    """Trigger an immediate reaper pass (handy after a disk fills). Returns the
+    per-pass counts."""
+    r = await _reap_flv_once()
+    _reap_stats["last_run"] = time.time()
+    _reap_stats["runs"] += 1
+    for k in ("redundant", "salvaged", "corrupt", "freed_bytes"):
+        _reap_stats[k] += r[k]
+    return r
 
 
 @app.get("/cookies", dependencies=[Depends(require_auth)])
