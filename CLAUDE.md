@@ -15,6 +15,11 @@ to nodes on deploy/push, and the Updates tab + version banner compare each node'
 VERSION against the control plane's — so bumping VERSION is what makes update
 detection work. Nothing auto-generates it; keep it current.
 
+**Append a short random suffix** (e.g. `2026.06.17.tjey`) rather than a bare date.
+Update detection is a string-equality check, so two builds on the same day with a
+date-only id look identical and the Updates tab won't flag anything — the suffix
+keeps every build distinct.
+
 ---
 
 ## File map
