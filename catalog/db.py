@@ -335,6 +335,23 @@ class Catalog:
             "ORDER BY verified_at DESC LIMIT 1", (recording_id,)).fetchone()
         return r["key"] if r else None
 
+    def evict_candidates(self, min_age_days: float = 7, limit: Optional[int] = None
+                         ) -> list[dict]:
+        """Phase 3 (SHADOW): recordings SAFE to evict from hot storage — they have
+        a verified cloud (cold) copy AND a local copy, and are older than
+        min_age_days. Identifies only; nothing is deleted here."""
+        cutoff = _now() - min_age_days * 86400
+        rows = self.conn.execute(
+            "SELECT r.id, r.filename, r.byte_size, r.started_at FROM recordings r "
+            "WHERE r.state='stored' "
+            "AND EXISTS (SELECT 1 FROM blob_locations b WHERE b.recording_id=r.id AND b.tier='cloud') "
+            "AND EXISTS (SELECT 1 FROM blob_locations b WHERE b.recording_id=r.id AND b.tier='local') "
+            "AND COALESCE(r.started_at, 0) < ? "
+            "ORDER BY r.started_at", (cutoff,)
+        ).fetchall()
+        out = [dict(r) for r in rows]
+        return out[:limit] if limit else out
+
     # ---- stats ------------------------------------------------------------
 
     def stats(self) -> dict:
@@ -347,12 +364,21 @@ class Catalog:
             "SELECT COUNT(*) AS n, COALESCE(SUM(byte_size),0) AS b FROM recordings").fetchone()
         transcripts = c.execute(
             "SELECT COUNT(*) AS n FROM transcripts WHERE state='done'").fetchone()["n"]
+        archived = c.execute(
+            "SELECT COUNT(DISTINCT recording_id) AS n FROM blob_locations "
+            "WHERE tier='cloud'").fetchone()["n"]
+        ec = self.evict_candidates()
         return {
             "recordings": total["n"],
             "bytes": total["b"],
             "by_state": by_state,
             "locations": locations,
             "transcripts_done": transcripts,
+            "cold": {
+                "archived": archived,
+                "evict_candidates": len(ec),
+                "reclaimable_bytes": sum((r["byte_size"] or 0) for r in ec),
+            },
             "jobs": self.jobs_summary(),
             "last_backfill": self.meta_get("last_backfill"),
             "last_parity": self.meta_get("last_parity"),

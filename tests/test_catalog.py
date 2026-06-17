@@ -273,6 +273,38 @@ def test_transcribe_backlog_and_promote():
     assert job and job["recording_id"] == r1
 
 
+# ---- Phase 3: cold tier + evict readiness --------------------------------
+
+def test_archive_status_and_evict_candidates():
+    cat = _cat()
+    old = time.time() - 30 * 86400
+    # a: stored, local + (soon) cloud, old  -> evict candidate
+    a = cat.upsert_recording(filename="TK_a_2026.05.05_10-00-00.mp4", state="stored",
+                             byte_size=100, started_at=old)
+    cat.add_location(a, "local", "sto1", "/d/a.mp4", verified=True)
+    # b: stored, local only (never archived) -> NOT a candidate
+    b = cat.upsert_recording(filename="TK_b_2026.05.05_11-00-00.mp4", state="stored",
+                             byte_size=200, started_at=old)
+    cat.add_location(b, "local", "sto1", "/d/b.mp4", verified=True)
+    # c: stored, local + cloud, but too NEW -> NOT a candidate
+    c = cat.upsert_recording(filename="TK_c_2026.06.17_09-00-00.mp4", state="stored",
+                             byte_size=50, started_at=time.time() - 3600)
+    cat.add_location(c, "local", "sto1", "/d/c.mp4", verified=True)
+    cat.add_location(c, "cloud", "b2", "TK_c.mp4", verified=True)
+
+    out = backfill.ingest_archive_status(
+        cat, {"TK_a_2026.05.05_10-00-00.mp4": {"archived": True, "remote": "b2:bucket"}})
+    assert out["archived"] == 1
+
+    ec = cat.evict_candidates(min_age_days=7)
+    assert len(ec) == 1 and ec[0]["id"] == a       # only a: archived + local + old
+
+    s = cat.stats()
+    assert s["cold"]["archived"] == 2              # a and c have cloud copies
+    assert s["cold"]["evict_candidates"] == 1
+    assert s["cold"]["reclaimable_bytes"] == 100
+
+
 # ---- runner --------------------------------------------------------------
 
 def _run_all() -> int:

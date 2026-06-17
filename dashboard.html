@@ -792,6 +792,14 @@ async function loadCatalog() {
     `<span style="display:inline-block;margin:0 14px 6px 0;"><b>${v.toLocaleString()}</b> <span style="color:#888;">${esc(k)}</span></span>`).join('');
   if (stateRows) html += `<div style="margin-bottom:16px;font-size:13px;">${stateRows}</div>`;
 
+  const cold = stats.cold||{};
+  html += `<h3 style="font-size:13px;color:#aaa;margin:16px 0 8px;">Cold tier (cloud archive)</h3>
+    <div style="font-size:13px;color:#ccc;">
+      <span style="margin-right:18px;">archived: <b>${(cold.archived||0).toLocaleString()}</b></span>
+      <span style="margin-right:18px;">safe to evict: <b>${(cold.evict_candidates||0).toLocaleString()}</b></span>
+      <span>reclaimable: <b>${fmtBytes(cold.reclaimable_bytes)}</b></span></div>
+    <div style="font-size:11px;color:#666;margin-top:4px;">verified cloud copy + local copy, &gt;7d old — safe to drop from hot disk (shadow: nothing is evicted)</div>`;
+
   if (drift && drift.parity) {
     const c = drift.parity.counts||{};
     html += `<h3 style="font-size:13px;color:#aaa;margin:16px 0 8px;">Drift vs live fleet</h3>

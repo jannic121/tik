@@ -218,17 +218,67 @@ def reconcile_states(cat: Catalog, live_filenames: set) -> dict:
     return {"evicted": evicted}
 
 
+def collect_archive_status(control_db: str | Path) -> dict:
+    """Phase 3: ask every healthy storage server which files are on the cloud
+    remote, via /files/archive-status (reads existing .archived markers). Merged
+    by filename. Storage servers not yet updated with that endpoint just 404 and
+    are skipped — so this degrades gracefully until the next storage push."""
+    import httpx
+
+    out: dict[str, dict] = {}
+    src = _ro(control_db)
+    try:
+        try:
+            stores = src.execute(
+                "SELECT url, token, label FROM storage_servers WHERE last_health_ok=1"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            stores = []
+        for s in stores:
+            try:
+                r = httpx.get(f"{s['url'].rstrip('/')}/files/archive-status",
+                              headers={"Authorization": f"Bearer {s['token']}"}, timeout=10)
+                if r.status_code == 200 and isinstance(r.json(), dict):
+                    for fn, info in r.json().items():
+                        if info.get("archived") and fn not in out:
+                            out[fn] = {**info, "store": s["label"]}
+            except Exception:
+                pass
+    finally:
+        src.close()
+    return out
+
+
+def ingest_archive_status(cat: Catalog, archive: dict) -> dict:
+    """Record a verified cloud (cold-tier) location for each archived recording."""
+    n = 0
+    for fn, info in (archive or {}).items():
+        if not str(fn).endswith(".mp4"):
+            continue
+        rec = cat.find_by_filename(fn)
+        if not rec:
+            continue
+        cat.add_location(rec["id"], "cloud",
+                         info.get("remote") or info.get("store") or "cloud",
+                         fn, verified=True)
+        n += 1
+    return {"archived": n}
+
+
 def scan_live(cat: Catalog, control_db: str | Path) -> dict:
     """One full self-correcting pass, read-only w.r.t. the fleet:
-    inventory -> transcript statuses (R2) -> state reconciliation (R1)."""
+    inventory -> transcript statuses (R2) -> archive/cold status (Phase 3) ->
+    state reconciliation (R1)."""
     inv = collect_live_inventory(control_db)
     out = ingest_inventory(cat, inv)
     statuses = collect_transcript_statuses(control_db)
     tr = ingest_transcript_statuses(cat, statuses)
+    archive = collect_archive_status(control_db)
+    ar = ingest_archive_status(cat, archive)
     live_names = {f["filename"] for f in inv
                   if (f.get("filename") or "").endswith(".mp4")
                   and not f["filename"].endswith("_flv.mp4")}
     rec = reconcile_states(cat, live_names)
     cat.meta_set("last_backfill", time.time())
-    return {**out, **tr, **rec, "live_files": len(inv),
+    return {**out, **tr, **ar, **rec, "live_files": len(inv),
             "transcript_statuses": statuses, "inventory": inv}

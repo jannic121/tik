@@ -1624,7 +1624,31 @@ async def files_inventory():
     return sorted(result, key=lambda x: x["mtime"], reverse=True)
 
 
-@app.put("/files/{username}/{filename}", dependencies=[Depends(require_auth)])
+@app.get("/files/archive-status", dependencies=[Depends(require_auth)])
+async def files_archive_status():
+    """Per-file cold-tier (archive) status, read from the existing .archived
+    markers archive_sweep() writes. Read-only — exposes state that already exists
+    so the control-plane catalog can track what's safely on the cloud remote."""
+    out: dict = {}
+    if not settings.watch_dir.exists():
+        return out
+    for mp4 in settings.watch_dir.rglob("*.mp4"):
+        marker = worker._archived_marker(mp4)
+        if not marker.exists():
+            continue
+        remote = None
+        try:
+            for tok in marker.read_text().split():
+                if tok.startswith("remote="):
+                    remote = tok.split("=", 1)[1]
+        except OSError:
+            pass
+        try:
+            out[mp4.name] = {"archived": True, "remote": remote,
+                             "archived_at": marker.stat().st_mtime}
+        except OSError:
+            out[mp4.name] = {"archived": True, "remote": remote}
+    return out
 async def receive_file(username: str, filename: str, request: Request):
     """Receive an MP4 streamed via PUT from the control plane upload worker.
     Writes atomically: data → .tmp file, then rename to final path.
