@@ -1,0 +1,323 @@
+"""SQLite-backed catalog: the strangler's single source of truth.
+
+Lives in its OWN database file (``CATALOG_DB``), separate from the control plane's
+``control.sqlite``, so Phase 0/1 shadow mode can never disturb the running system.
+Stdlib-only — no third-party imports here.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from .names import parse_recording_name
+
+_SCHEMA = (Path(__file__).resolve().parent / "schema.sql").read_text(encoding="utf-8")
+
+# Monotonic-ish pipeline ordering, used so an upsert/transition never regresses a
+# recording's state (a late 'discovered' can't overwrite a known 'stored').
+_STATE_RANK = {
+    "discovered": 0, "recording": 1, "orphan_flv": 1, "stored": 2,
+    "transcribing": 3, "transcribed": 4, "archived": 5, "evicted": 6, "missing": 7,
+}
+
+
+def _rank(state: Optional[str]) -> int:
+    return _STATE_RANK.get(state or "", -1)
+
+
+def default_path() -> Path:
+    return Path(os.environ.get("CATALOG_DB", Path.home() / ".tt-recorder" / "catalog.sqlite"))
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _uid() -> str:
+    return str(uuid.uuid4())
+
+
+def _open(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    return conn
+
+
+class Catalog:
+    """A thin, well-defined data layer over the catalog DB.
+
+    All writes go through a lock so the same Catalog instance is safe to share
+    between the control plane's event loop and a background shadow task.
+    """
+
+    def __init__(self, path: Optional[Path | str] = None):
+        self.path = Path(path) if path else default_path()
+        self.conn = _open(self.path)
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    # ---- meta -------------------------------------------------------------
+
+    def meta_get(self, key: str, default=None):
+        r = self.conn.execute("SELECT value FROM catalog_meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+
+    def meta_set(self, key: str, value) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO catalog_meta(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)),
+            )
+            self.conn.commit()
+
+    # ---- recordings -------------------------------------------------------
+
+    def upsert_recording(self, *, filename: str, creator: Optional[str] = None,
+                         node: Optional[str] = None, backend_pk: Optional[str] = None,
+                         byte_size: Optional[int] = None, started_at: Optional[float] = None,
+                         state: Optional[str] = None) -> str:
+        """Insert or update a recording keyed by its final filename. Gaps are filled
+        (COALESCE) and state only ever advances — existing data is never clobbered."""
+        parsed = parse_recording_name(filename)
+        if parsed:
+            filename = parsed.filename                 # normalise _flv -> final
+            creator = creator or parsed.creator
+            if started_at is None:
+                started_at = parsed.started_at
+        creator = (creator or "").lstrip("@").lower() or None
+        with self._lock:
+            now = _now()
+            row = self.conn.execute(
+                "SELECT id, state FROM recordings WHERE filename=?", (filename,)
+            ).fetchone()
+            if row:
+                rid = row["id"]
+                self.conn.execute(
+                    "UPDATE recordings SET creator=COALESCE(?,creator), node=COALESCE(?,node), "
+                    "backend_pk=COALESCE(?,backend_pk), byte_size=COALESCE(?,byte_size), "
+                    "started_at=COALESCE(?,started_at), updated_at=? WHERE id=?",
+                    (creator, node, backend_pk, byte_size, started_at, now, rid),
+                )
+                if state and _rank(state) > _rank(row["state"]):
+                    self.conn.execute(
+                        "UPDATE recordings SET state=?, updated_at=? WHERE id=?",
+                        (state, now, rid),
+                    )
+                self.conn.commit()
+                return rid
+            rid = _uid()
+            self.conn.execute(
+                "INSERT INTO recordings(id,creator,filename,node,backend_pk,byte_size,"
+                "started_at,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (rid, creator or "", filename, node, backend_pk, byte_size, started_at,
+                 state or "discovered", now, now),
+            )
+            self.conn.commit()
+            return rid
+
+    def set_state(self, recording_id: str, state: str, error: Optional[str] = None,
+                  force: bool = False) -> None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT state FROM recordings WHERE id=?", (recording_id,)
+            ).fetchone()
+            if not row:
+                return
+            if force or _rank(state) >= _rank(row["state"]):
+                self.conn.execute(
+                    "UPDATE recordings SET state=?, error=?, updated_at=? WHERE id=?",
+                    (state, error, _now(), recording_id),
+                )
+                self.conn.commit()
+
+    def find_by_filename(self, filename: str) -> Optional[dict]:
+        parsed = parse_recording_name(filename)
+        fn = parsed.filename if parsed else filename
+        r = self.conn.execute("SELECT * FROM recordings WHERE filename=?", (fn,)).fetchone()
+        return dict(r) if r else None
+
+    def get_recording(self, recording_id: str) -> Optional[dict]:
+        r = self.conn.execute("SELECT * FROM recordings WHERE id=?", (recording_id,)).fetchone()
+        return dict(r) if r else None
+
+    # ---- locations --------------------------------------------------------
+
+    def add_location(self, recording_id: str, tier: str, store: str, key: str,
+                     byte_size: Optional[int] = None, checksum: Optional[str] = None,
+                     verified: bool = False) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO blob_locations(id,recording_id,tier,store,key,byte_size,"
+                "checksum,verified_at,created_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(recording_id,tier,store) DO UPDATE SET "
+                "key=excluded.key, "
+                "byte_size=COALESCE(excluded.byte_size, blob_locations.byte_size), "
+                "checksum=COALESCE(excluded.checksum, blob_locations.checksum), "
+                "verified_at=COALESCE(excluded.verified_at, blob_locations.verified_at)",
+                (_uid(), recording_id, tier, store, key, byte_size, checksum,
+                 _now() if verified else None, _now()),
+            )
+            self.conn.commit()
+
+    def locations(self, recording_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM blob_locations WHERE recording_id=?", (recording_id,)).fetchall()]
+
+    # ---- transcripts ------------------------------------------------------
+
+    def set_transcript(self, recording_id: str, state: str, tier: Optional[str] = None,
+                       store: Optional[str] = None, key: Optional[str] = None,
+                       language: Optional[str] = None, model: Optional[str] = None,
+                       words: Optional[int] = None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO transcripts(recording_id,tier,store,key,language,model,words,"
+                "state,updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(recording_id) DO UPDATE SET "
+                "tier=COALESCE(excluded.tier, transcripts.tier), "
+                "store=COALESCE(excluded.store, transcripts.store), "
+                "key=COALESCE(excluded.key, transcripts.key), "
+                "language=COALESCE(excluded.language, transcripts.language), "
+                "model=COALESCE(excluded.model, transcripts.model), "
+                "words=COALESCE(excluded.words, transcripts.words), "
+                "state=excluded.state, updated_at=excluded.updated_at",
+                (recording_id, tier, store, key, language, model, words, state, _now()),
+            )
+            self.conn.commit()
+
+    # ---- jobs -------------------------------------------------------------
+
+    def enqueue_job(self, kind: str, recording_id: Optional[str] = None,
+                    node: Optional[str] = None, shadow: bool = True,
+                    run_after: float = 0.0, max_attempts: int = 5) -> Optional[str]:
+        """Create a job. De-duplicates: if an open (ready/running) job of the same
+        kind already exists for this recording, returns None and creates nothing."""
+        with self._lock:
+            if recording_id:
+                dup = self.conn.execute(
+                    "SELECT id FROM jobs WHERE kind=? AND recording_id=? "
+                    "AND state IN ('ready','running')",
+                    (kind, recording_id),
+                ).fetchone()
+                if dup:
+                    return None
+            jid = _uid()
+            now = _now()
+            self.conn.execute(
+                "INSERT INTO jobs(id,kind,recording_id,node,state,shadow,run_after,"
+                "max_attempts,created_at,updated_at) VALUES(?,?,?,?,'ready',?,?,?,?,?)",
+                (jid, kind, recording_id, node, 1 if shadow else 0, run_after,
+                 max_attempts, now, now),
+            )
+            self.conn.commit()
+            return jid
+
+    def claim_job(self, node: Optional[str] = None, worker: Optional[str] = None,
+                  kinds: Optional[list[str]] = None, include_shadow: bool = False
+                  ) -> Optional[dict]:
+        """Atomically claim the next runnable job (oldest run_after first). Shadow
+        jobs are skipped unless include_shadow=True. Version-proof (no RETURNING)."""
+        with self._lock:
+            now = _now()
+            clause = "state='ready' AND run_after<=?"
+            params: list = [now]
+            if not include_shadow:
+                clause += " AND shadow=0"
+            if node is not None:
+                clause += " AND (node IS NULL OR node=?)"
+                params.append(node)
+            if kinds:
+                clause += " AND kind IN (%s)" % ",".join("?" * len(kinds))
+                params += list(kinds)
+            row = self.conn.execute(
+                f"SELECT * FROM jobs WHERE {clause} ORDER BY run_after LIMIT 1", params
+            ).fetchone()
+            if not row:
+                return None
+            cur = self.conn.execute(
+                "UPDATE jobs SET state='running', claimed_by=?, claimed_at=?, "
+                "attempts=attempts+1, updated_at=? WHERE id=? AND state='ready'",
+                (worker, now, now, row["id"]),
+            )
+            self.conn.commit()
+            if cur.rowcount == 0:
+                return None
+            out = dict(row)
+            out.update(state="running", claimed_by=worker, attempts=row["attempts"] + 1)
+            return out
+
+    def complete_job(self, job_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE jobs SET state='done', progress=1.0, updated_at=? WHERE id=?",
+                (_now(), job_id),
+            )
+            self.conn.commit()
+
+    def fail_job(self, job_id: str, error, backoff: float = 60.0) -> None:
+        """Mark a running job failed; retry with backoff until max_attempts, then
+        leave it 'failed' for inspection."""
+        with self._lock:
+            r = self.conn.execute(
+                "SELECT attempts, max_attempts FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if not r:
+                return
+            now = _now()
+            if r["attempts"] >= r["max_attempts"]:
+                self.conn.execute(
+                    "UPDATE jobs SET state='failed', last_error=?, updated_at=? WHERE id=?",
+                    (str(error)[:500], now, job_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE jobs SET state='ready', last_error=?, run_after=?, updated_at=? "
+                    "WHERE id=?",
+                    (str(error)[:500], now + backoff, now, job_id),
+                )
+            self.conn.commit()
+
+    def jobs_summary(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT kind, state, shadow, COUNT(*) AS count FROM jobs "
+            "GROUP BY kind, state, shadow ORDER BY kind, state").fetchall()]
+
+    # ---- stats ------------------------------------------------------------
+
+    def stats(self) -> dict:
+        c = self.conn
+        by_state = {r["state"]: r["count"] for r in c.execute(
+            "SELECT state, COUNT(*) AS count FROM recordings GROUP BY state").fetchall()}
+        locations = {r["tier"]: r["count"] for r in c.execute(
+            "SELECT tier, COUNT(*) AS count FROM blob_locations GROUP BY tier").fetchall()}
+        total = c.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(byte_size),0) AS b FROM recordings").fetchone()
+        transcripts = c.execute(
+            "SELECT COUNT(*) AS n FROM transcripts WHERE state='done'").fetchone()["n"]
+        return {
+            "recordings": total["n"],
+            "bytes": total["b"],
+            "by_state": by_state,
+            "locations": locations,
+            "transcripts_done": transcripts,
+            "jobs": self.jobs_summary(),
+            "last_backfill": self.meta_get("last_backfill"),
+            "last_parity": self.meta_get("last_parity"),
+        }
