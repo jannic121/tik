@@ -3422,6 +3422,29 @@ async def catalog_drift():
     }
 
 
+@app.get("/api/flv-status", dependencies=[Depends(require_login)])
+async def flv_status_all():
+    """Aggregate the orphaned-_flv reaper status from every recorder backend.
+    Recorders that haven't been push-updated yet return 404 → flagged
+    'not_deployed' so the UI can prompt a push."""
+    async with _db_lock:
+        backends = db.execute(
+            "SELECT id, backend_id, url, auth_token FROM backends"
+        ).fetchall()
+    out = []
+    for b in backends:
+        entry = {"backend_pk": b["id"], "backend_id": b["backend_id"], "reachable": False}
+        code, body = await _call(b["url"], b["auth_token"], "GET", "/flv/status")
+        if code == 200 and isinstance(body, dict):
+            entry["reachable"] = True
+            entry.update(body)
+        elif code == 404:
+            entry["reachable"] = True
+            entry["not_deployed"] = True
+        out.append(entry)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Deploy endpoint
 
