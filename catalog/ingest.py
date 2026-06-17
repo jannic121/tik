@@ -72,6 +72,17 @@ def generate_shadow_jobs(cat: Catalog) -> int:
     return created
 
 
+def promote_backlog(cat: Catalog, limit: int = 0) -> int:
+    """Create REAL (non-shadow) transcribe jobs for the current backlog. This is
+    the Phase 2 'go live' switch — call it only when you actually want the worker
+    to start transcribing. Returns how many real jobs were created."""
+    created = 0
+    for rec in cat.transcribe_backlog(limit=limit or None):
+        if cat.enqueue_job("transcribe", recording_id=rec["id"], shadow=False):
+            created += 1
+    return created
+
+
 def compare_to_live(cat: Catalog, live_statuses: dict) -> dict:
     """Compare what the catalog *would* transcribe against what the live worker
     reports, so we can validate the catalog before cutting transcription over.

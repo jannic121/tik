@@ -44,6 +44,9 @@ def main(argv=None) -> int:
     p.add_argument("--control-db")
     sub.add_parser("jobs")
     sub.add_parser("scan-jobs")
+    sub.add_parser("backlog")
+    pr = sub.add_parser("promote", help="Phase 2 go-live: create REAL transcribe jobs")
+    pr.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
 
     cat = Catalog()
@@ -60,7 +63,8 @@ def main(argv=None) -> int:
             print(f"(control db not found at {cdb} — skipping DB import)", file=sys.stderr)
         if args.live:
             live = bf.scan_live(cat, cdb)
-            out.update({k: v for k, v in live.items() if k != "inventory"})
+            out.update({k: v for k, v in live.items()
+                        if k not in ("inventory", "transcript_statuses")})
         _dump(out)
 
     elif args.cmd == "parity":
@@ -81,6 +85,16 @@ def main(argv=None) -> int:
 
     elif args.cmd == "jobs":
         _dump(cat.jobs_summary())
+
+    elif args.cmd == "backlog":
+        bl = cat.transcribe_backlog()
+        _dump({"backlog": len(bl),
+               "sample": [r["filename"] for r in bl[:20]]})
+
+    elif args.cmd == "promote":
+        n = ing.promote_backlog(cat, limit=args.limit)
+        print(f"created {n} REAL (non-shadow) transcribe job(s) — Phase 2 is now live "
+              f"for those; start a worker with: python worker_transcribe.py run --execute")
 
     return 0
 

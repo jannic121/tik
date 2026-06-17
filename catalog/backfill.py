@@ -85,12 +85,14 @@ def ingest_inventory(cat: Catalog, inventory: list[dict]) -> dict:
                              byte_size=f.get("size_bytes"), verified=True)
             recs += 1
         elif fn.endswith(".txt"):
+            # Transcript state lives in the transcripts table, NOT the recording
+            # state — a recording can be both transcribed and evicted, so the two
+            # are tracked independently.
             mp4 = fn[:-4] + ".mp4"
             rec = cat.find_by_filename(mp4)
             if rec:
                 cat.set_transcript(rec["id"], "done", tier=tier, store=store,
                                    key=f.get("path"))
-                cat.set_state(rec["id"], "transcribed")
                 txts += 1
     return {"recordings_seen": recs, "transcripts_seen": txts}
 
@@ -144,9 +146,89 @@ def collect_live_inventory(control_db: str | Path) -> list[dict]:
     return inv
 
 
+def collect_transcript_statuses(control_db: str | Path) -> dict:
+    """R2: ask every healthy storage server for {filename: done|processing|pending}
+    via the EXISTING /transcripts/all-statuses endpoint and merge (done wins).
+
+    This needs no code on the storage/transcription servers — that endpoint already
+    ships in the current worker. Because it queries every registered server and
+    merges by filename, transcripts living on a *different* box than the recording
+    are still picked up, wherever they are."""
+    import httpx
+
+    rank = {"done": 3, "processing": 2, "pending": 1, "none": 0}
+    statuses: dict[str, str] = {}
+    src = _ro(control_db)
+    try:
+        try:
+            stores = src.execute(
+                "SELECT url, token FROM storage_servers WHERE last_health_ok=1"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            stores = []
+        for s in stores:
+            try:
+                r = httpx.get(f"{s['url'].rstrip('/')}/transcripts/all-statuses",
+                              headers={"Authorization": f"Bearer {s['token']}"}, timeout=10)
+                if r.status_code == 200 and isinstance(r.json(), dict):
+                    for fn, st in r.json().items():
+                        if rank.get(st, 0) > rank.get(statuses.get(fn, "none"), 0):
+                            statuses[fn] = st
+            except Exception:
+                pass
+    finally:
+        src.close()
+    return statuses
+
+
+def ingest_transcript_statuses(cat: Catalog, statuses: dict) -> dict:
+    """Fold merged transcript statuses into the catalog. 'done' marks the
+    transcript done and cancels any outstanding transcribe job for that recording;
+    recording *state* is left alone (transcribed/evicted are independent facts)."""
+    done = pending = 0
+    for fn, st in (statuses or {}).items():
+        if not str(fn).endswith(".mp4"):
+            continue
+        rec = cat.find_by_filename(fn)
+        if not rec:
+            continue
+        if st == "done":
+            cat.set_transcript(rec["id"], "done")
+            cat.cancel_open_jobs(rec["id"], "transcribe")
+            done += 1
+        elif st in ("processing", "pending"):
+            cat.set_transcript(rec["id"], "pending")
+            pending += 1
+    return {"transcribed": done, "transcribing": pending}
+
+
+def reconcile_states(cat: Catalog, live_filenames: set) -> dict:
+    """R1: a recording marked 'stored' whose .mp4 isn't in the live inventory is no
+    longer on hot storage — relabel it 'evicted' so by_state reflects what's
+    actually on disk. Non-destructive: nothing is deleted, only the label changes."""
+    evicted = 0
+    rows = cat.conn.execute(
+        "SELECT id, filename FROM recordings WHERE state='stored'").fetchall()
+    for r in rows:
+        if r["filename"] not in live_filenames:
+            cat.set_state(r["id"], "evicted")
+            # No local copy → can't be transcribed here; drop any stale transcribe job.
+            cat.cancel_open_jobs(r["id"], "transcribe")
+            evicted += 1
+    return {"evicted": evicted}
+
+
 def scan_live(cat: Catalog, control_db: str | Path) -> dict:
-    """Collect a live inventory and fold it into the catalog. Returns the raw
-    inventory too (under 'inventory') so a parity run can reuse it."""
+    """One full self-correcting pass, read-only w.r.t. the fleet:
+    inventory -> transcript statuses (R2) -> state reconciliation (R1)."""
     inv = collect_live_inventory(control_db)
     out = ingest_inventory(cat, inv)
-    return {**out, "live_files": len(inv), "inventory": inv}
+    statuses = collect_transcript_statuses(control_db)
+    tr = ingest_transcript_statuses(cat, statuses)
+    live_names = {f["filename"] for f in inv
+                  if (f.get("filename") or "").endswith(".mp4")
+                  and not f["filename"].endswith("_flv.mp4")}
+    rec = reconcile_states(cat, live_names)
+    cat.meta_set("last_backfill", time.time())
+    return {**out, **tr, **rec, "live_files": len(inv),
+            "transcript_statuses": statuses, "inventory": inv}

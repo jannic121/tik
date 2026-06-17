@@ -1298,23 +1298,21 @@ async def _catalog_shadow_loop() -> None:
 
     Creates only shadow jobs — it executes nothing and touches only the separate
     catalog DB. Fully guarded so it can never disturb the running system."""
-    from catalog import ingest as _ing
+    from catalog import ingest as _ing, backfill as _bf
     interval = int(os.environ.get("CATALOG_SHADOW_INTERVAL", "900"))
     while True:
         try:
             if _catalog is not None:
+                # Full self-correcting pass: inventory + transcript statuses (R2) +
+                # state reconciliation (R1). Run off the event loop; read-only vs the
+                # fleet and vs control.sqlite (opened mode=ro).
+                res = await asyncio.to_thread(_bf.scan_live, _catalog, str(settings.db_path))
                 created = _ing.generate_shadow_jobs(_catalog)
-                statuses: dict = {}
-                for s in _storage_healthy():
-                    code, body = await _tw_call(s, "GET", "/transcripts/all-statuses")
-                    if code == 200 and isinstance(body, dict):
-                        statuses.update(body)
-                cmp = _ing.compare_to_live(_catalog, statuses)
+                cmp = _ing.compare_to_live(_catalog, res.get("transcript_statuses", {}))
                 _catalog.meta_set("last_compare", json.dumps(cmp["counts"]))
-                if created or cmp["counts"]["catalog_only"]:
-                    log.info("catalog shadow: +%d transcribe-intent · catalog_only=%d "
-                             "already_done_live=%d", created,
-                             cmp["counts"]["catalog_only"], cmp["counts"]["already_done_live"])
+                log.info("catalog shadow: backlog=%d transcribed+%d evicted+%d intent+%d",
+                         cmp["counts"]["would_transcribe"], res.get("transcribed", 0),
+                         res.get("evicted", 0), created)
         except Exception:
             log.debug("catalog shadow loop error (ignored)", exc_info=True)
         await asyncio.sleep(interval)

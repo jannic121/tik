@@ -299,6 +299,42 @@ class Catalog:
             "SELECT kind, state, shadow, COUNT(*) AS count FROM jobs "
             "GROUP BY kind, state, shadow ORDER BY kind, state").fetchall()]
 
+    def cancel_open_jobs(self, recording_id: str, kind: Optional[str] = None) -> int:
+        """Cancel ready/running jobs for a recording (e.g. a transcribe job once the
+        recording turns out to be already transcribed). Returns rows affected."""
+        with self._lock:
+            if kind:
+                cur = self.conn.execute(
+                    "UPDATE jobs SET state='cancelled', updated_at=? WHERE recording_id=? "
+                    "AND kind=? AND state IN ('ready','running')",
+                    (_now(), recording_id, kind))
+            else:
+                cur = self.conn.execute(
+                    "UPDATE jobs SET state='cancelled', updated_at=? WHERE recording_id=? "
+                    "AND state IN ('ready','running')", (_now(), recording_id))
+            self.conn.commit()
+            return cur.rowcount
+
+    def transcribe_backlog(self, limit: Optional[int] = None) -> list[dict]:
+        """Recordings that genuinely still need transcription: on hot storage
+        ('stored'), no done transcript. This is the *real* backlog once R2 has
+        marked already-transcribed recordings."""
+        rows = self.conn.execute(
+            "SELECT r.id, r.filename, r.creator, r.started_at FROM recordings r "
+            "LEFT JOIN transcripts t ON t.recording_id = r.id "
+            "WHERE r.state = 'stored' AND (t.state IS NULL OR t.state != 'done') "
+            "ORDER BY r.started_at"
+        ).fetchall()
+        out = [dict(r) for r in rows]
+        return out[:limit] if limit else out
+
+    def local_path(self, recording_id: str) -> Optional[str]:
+        """First local blob key (filesystem path) for a recording, if any."""
+        r = self.conn.execute(
+            "SELECT key FROM blob_locations WHERE recording_id=? AND tier='local' "
+            "ORDER BY verified_at DESC LIMIT 1", (recording_id,)).fetchone()
+        return r["key"] if r else None
+
     # ---- stats ------------------------------------------------------------
 
     def stats(self) -> dict:

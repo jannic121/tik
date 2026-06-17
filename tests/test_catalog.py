@@ -164,7 +164,12 @@ def test_ingest_inventory_and_transcript_sidecar():
     out = backfill.ingest_inventory(cat, inv)
     assert out["recordings_seen"] == 1 and out["transcripts_seen"] == 1
     rec = cat.find_by_filename("TK_z_2026.06.05_16-00-00.mp4")
-    assert rec["state"] == "transcribed"
+    # transcript state is decoupled from recording state: the .txt marks the
+    # transcript done, but the recording stays 'stored'
+    assert rec["state"] == "stored"
+    t = cat.conn.execute("SELECT state FROM transcripts WHERE recording_id=?",
+                         (rec["id"],)).fetchone()
+    assert t and t["state"] == "done"
 
 
 # ---- parity --------------------------------------------------------------
@@ -223,6 +228,49 @@ def test_on_event_never_raises_on_garbage():
                 {"event": {"kind": "session_started", "detail": {"path": "junk.mp4"}}}):
         ingest.on_event(cat, bad)            # must not raise
     assert cat.stats()["recordings"] == 0
+
+
+# ---- R1: state reconciliation --------------------------------------------
+
+def test_reconcile_evicts_absent():
+    cat = _cat()
+    a = cat.upsert_recording(filename="TK_a_2026.06.05_10-00-00.mp4", state="stored")
+    b = cat.upsert_recording(filename="TK_b_2026.06.05_11-00-00.mp4", state="stored")
+    out = backfill.reconcile_states(cat, {"TK_a_2026.06.05_10-00-00.mp4"})  # only a is live
+    assert out["evicted"] == 1
+    assert cat.get_recording(a)["state"] == "stored"
+    assert cat.get_recording(b)["state"] == "evicted"
+
+
+# ---- R2: transcript statuses ---------------------------------------------
+
+def test_ingest_transcript_statuses_marks_done_and_cancels_jobs():
+    cat = _cat()
+    fn = "TK_t_2026.06.05_12-00-00.mp4"
+    rid = cat.upsert_recording(filename=fn, state="stored")
+    cat.enqueue_job("transcribe", recording_id=rid, shadow=True)
+    out = backfill.ingest_transcript_statuses(cat, {fn: "done", "unknown.mp4": "done"})
+    assert out["transcribed"] == 1
+    t = cat.conn.execute("SELECT state FROM transcripts WHERE recording_id=?",
+                         (rid,)).fetchone()
+    assert t["state"] == "done"
+    js = {(s["kind"], s["state"]): s["count"] for s in cat.jobs_summary()}
+    assert js.get(("transcribe", "cancelled")) == 1          # stale shadow job cancelled
+    assert all(r["id"] != rid for r in cat.transcribe_backlog())  # gone from backlog
+
+
+# ---- Phase 2: backlog + go-live -----------------------------------------
+
+def test_transcribe_backlog_and_promote():
+    cat = _cat()
+    r1 = cat.upsert_recording(filename="TK_p_2026.06.05_09-00-00.mp4", state="stored")
+    r2 = cat.upsert_recording(filename="TK_q_2026.06.05_09-30-00.mp4", state="stored")
+    cat.set_transcript(r2, "done")                  # already done -> not in backlog
+    bl = cat.transcribe_backlog()
+    assert len(bl) == 1 and bl[0]["id"] == r1
+    assert ingest.promote_backlog(cat) == 1
+    job = cat.claim_job(kinds=["transcribe"])       # promoted job is REAL + claimable
+    assert job and job["recording_id"] == r1
 
 
 # ---- runner --------------------------------------------------------------
