@@ -134,6 +134,13 @@ settings = Settings()
 RECORDER_DEPLOY_FILES = ["provision.sh", "watcher.py", "app.py", "chat_recorder.py", "VERSION"]
 STORAGE_DEPLOY_FILES  = ["provision_storage.sh", "transcription_worker.py", "VERSION"]
 
+# --- Strangler catalog (Phase 0/1, shadow mode) ----------------------------
+# Optional and entirely inert unless CATALOG_ENABLED=1. It uses a SEPARATE
+# database (CATALOG_DB) and every call site is wrapped so a catalog fault can
+# never affect the running control plane. See catalog/README.md.
+CATALOG_ENABLED = os.environ.get("CATALOG_ENABLED", "0") == "1"
+_catalog = None   # set in lifespan when enabled
+
 # Strip ANSI/VT100 escape sequences from SSH output before sending to browser
 _ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -1284,6 +1291,35 @@ async def _maintenance_worker() -> None:
             log.warning("maintenance worker error: %s", e)
 
 
+async def _catalog_shadow_loop() -> None:
+    """Phase 1 shadow worker. Periodically materialises transcribe-job *intent*
+    in the catalog and compares it against what the live transcription workers
+    report, so the catalog can be validated before anything depends on it.
+
+    Creates only shadow jobs — it executes nothing and touches only the separate
+    catalog DB. Fully guarded so it can never disturb the running system."""
+    from catalog import ingest as _ing
+    interval = int(os.environ.get("CATALOG_SHADOW_INTERVAL", "900"))
+    while True:
+        try:
+            if _catalog is not None:
+                created = _ing.generate_shadow_jobs(_catalog)
+                statuses: dict = {}
+                for s in _storage_healthy():
+                    code, body = await _tw_call(s, "GET", "/transcripts/all-statuses")
+                    if code == 200 and isinstance(body, dict):
+                        statuses.update(body)
+                cmp = _ing.compare_to_live(_catalog, statuses)
+                _catalog.meta_set("last_compare", json.dumps(cmp["counts"]))
+                if created or cmp["counts"]["catalog_only"]:
+                    log.info("catalog shadow: +%d transcribe-intent · catalog_only=%d "
+                             "already_done_live=%d", created,
+                             cmp["counts"]["catalog_only"], cmp["counts"]["already_done_live"])
+        except Exception:
+            log.debug("catalog shadow loop error (ignored)", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO,
@@ -1322,6 +1358,16 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_auto_backup_worker(), name="auto-backup")
     asyncio.create_task(_move_cycle(), name="move-worker")
     asyncio.create_task(_maintenance_worker(), name="maintenance")
+    if CATALOG_ENABLED:
+        global _catalog
+        try:
+            from catalog import Catalog
+            _catalog = Catalog()
+            log.info("catalog shadow mode ENABLED (db=%s)", _catalog.path)
+            asyncio.create_task(_catalog_shadow_loop(), name="catalog-shadow")
+        except Exception:
+            log.exception("catalog init failed — continuing without it")
+            _catalog = None
     yield
     task.cancel()
     try:
@@ -3343,7 +3389,39 @@ async def receive_event(req: Request):
             db.commit()
         except Exception:
             log.exception("event store failed")
+    # Phase 1 write-through: advance the shadow catalog from this event. Best-effort
+    # and isolated — a catalog fault must never affect event ingestion.
+    if _catalog is not None:
+        try:
+            from catalog import ingest as _cat_ingest
+            _cat_ingest.on_event(_catalog, body)
+        except Exception:
+            log.debug("catalog ingest failed (ignored)", exc_info=True)
     return {"ok": True, "event_id": eid}
+
+
+# ---------------------------------------------------------------------------
+# Strangler catalog (read-only visibility into shadow mode)
+
+@app.get("/api/catalog/stats", dependencies=[Depends(require_login)])
+async def catalog_stats():
+    if _catalog is None:
+        raise HTTPException(404, "catalog shadow mode is off (set CATALOG_ENABLED=1)")
+    return _catalog.stats()
+
+
+@app.get("/api/catalog/drift", dependencies=[Depends(require_login)])
+async def catalog_drift():
+    """The most recent parity report (catalog vs live inventory), if any, plus the
+    last shadow-vs-live transcribe comparison."""
+    if _catalog is None:
+        raise HTTPException(404, "catalog shadow mode is off (set CATALOG_ENABLED=1)")
+    rep = _catalog.meta_get("last_parity_report")
+    cmp = _catalog.meta_get("last_compare")
+    return {
+        "parity": json.loads(rep) if rep else None,
+        "transcribe_compare": json.loads(cmp) if cmp else None,
+    }
 
 
 # ---------------------------------------------------------------------------
