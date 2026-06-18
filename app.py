@@ -661,6 +661,16 @@ async def _reap_flv_once() -> dict:
                                 flv.name)
         except OSError as e:
             log.warning("reaper: error handling %s: %s", flv.name, e)
+    # Sweep stale temp artifacts (failed remux/transfer leftovers) older than 1h.
+    for pat in ("*.remuxing", "*.tmp", "*.part"):
+        for tmp in root.rglob(pat):
+            try:
+                if now - tmp.stat().st_mtime < 3600:
+                    continue          # could be an in-flight write
+                res["freed_bytes"] += tmp.stat().st_size
+                tmp.unlink()
+            except OSError:
+                pass
     return res
 
 
@@ -764,6 +774,59 @@ async def flv_reap_now():
     for k in ("redundant", "salvaged", "corrupt", "freed_bytes"):
         _reap_stats[k] += r[k]
     return r
+
+
+@app.get("/disk/breakdown", dependencies=[Depends(require_auth)])
+async def disk_breakdown():
+    """Categorise what's actually using RECORDINGS_ROOT, so a 'disk full' that
+    'shouldn't be that much' can be explained at a glance. Highlights reclaimable
+    junk (redundant _flv whose final exists, leftover temp files) and how much of
+    the disk is used by things OUTSIDE the recordings dir (OS, logs, model cache)."""
+    root = settings.recordings_root
+    du = shutil.disk_usage(root if root.exists() else "/")
+    cats = {"final_mp4": 0, "orphan_flv": 0, "redundant_flv": 0, "temp": 0,
+            "logs": 0, "chat": 0, "transcripts": 0, "other": 0}
+    counts = {k: 0 for k in cats}
+    by_creator: dict[str, int] = {}
+    if root.exists():
+        for f in root.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                sz = f.stat().st_size
+            except OSError:
+                continue
+            name = f.name
+            if name.endswith("_flv.mp4"):
+                final = f.with_name(name[:-len("_flv.mp4")] + ".mp4")
+                cat = "redundant_flv" if final.exists() else "orphan_flv"
+            elif name.endswith(".mp4"):
+                cat = "final_mp4"
+            elif name.endswith((".remuxing", ".tmp", ".part")):
+                cat = "temp"
+            elif name.endswith(".log"):
+                cat = "logs"
+            elif name.endswith("_chat.jsonl"):
+                cat = "chat"
+            elif name.endswith((".txt", ".srt", ".json")):
+                cat = "transcripts"
+            else:
+                cat = "other"
+            cats[cat] += sz
+            counts[cat] += 1
+            by_creator[f.parent.name] = by_creator.get(f.parent.name, 0) + sz
+    used = du.total - du.free
+    in_recordings = sum(cats.values())
+    top = sorted(by_creator.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    return {
+        "root": str(root),
+        "disk_total": du.total, "disk_free": du.free, "disk_used": used,
+        "categories": cats, "counts": counts,
+        "reclaimable_bytes": cats["redundant_flv"] + cats["temp"],
+        "recordings_bytes": in_recordings,
+        "outside_recordings_bytes": max(0, used - in_recordings),
+        "top_creators": [{"username": u, "bytes": b} for u, b in top],
+    }
 
 
 @app.get("/cookies", dependencies=[Depends(require_auth)])

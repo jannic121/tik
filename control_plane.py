@@ -3458,6 +3458,41 @@ async def flv_status_all():
     return out
 
 
+@app.get("/api/disk-breakdown", dependencies=[Depends(require_login)])
+async def disk_breakdown_all():
+    """Per-recorder disk usage by category (final vs redundant-flv vs temp vs logs
+    vs outside-recordings), so a surprising 'disk full' is explainable + reclaimable."""
+    async with _db_lock:
+        backends = db.execute(
+            "SELECT id, backend_id, url, auth_token FROM backends WHERE last_health_ok=1"
+        ).fetchall()
+    out = []
+    for b in backends:
+        entry = {"backend_pk": b["id"], "backend_id": b["backend_id"], "reachable": False}
+        code, body = await _call(b["url"], b["auth_token"], "GET", "/disk/breakdown")
+        if code == 200 and isinstance(body, dict):
+            entry["reachable"] = True
+            entry.update(body)
+        elif code == 404:
+            entry["reachable"] = True
+            entry["not_deployed"] = True
+        out.append(entry)
+    return out
+
+
+@app.post("/api/backends/{pk}/reap-now", dependencies=[Depends(require_login)])
+async def backend_reap_now(pk: str):
+    """Trigger the orphan-_flv + temp reaper on a backend immediately."""
+    async with _db_lock:
+        row = db.execute("SELECT url, auth_token FROM backends WHERE id=?", (pk,)).fetchone()
+    if not row:
+        raise HTTPException(404, "backend not found")
+    code, body = await _call(row["url"], row["auth_token"], "POST", "/flv/reap-now")
+    if code != 200:
+        raise HTTPException(502 if code < 0 else code, f"backend error {code}: {body}")
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Deploy endpoint
 

@@ -757,6 +757,18 @@ async function logout() {
   window.location='/login';
 }
 
+async function reapNow(pk, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Reaping…'; }
+  try {
+    const r = await api('/api/backends/'+pk+'/reap-now', {method:'POST'});
+    if (r && r.ok) {
+      const x = await r.json();
+      alert(`Reaped: ${x.redundant||0} redundant, ${x.salvaged||0} salvaged, freed ${fmtBytes(x.freed_bytes)}`);
+      loadCatalog();
+    } else { alert('Reap failed'); if (btn){ btn.disabled=false; btn.textContent='Reap now'; } }
+  } catch(e) { alert('Reap failed: '+e.message); if (btn){ btn.disabled=false; btn.textContent='Reap now'; } }
+}
+
 // ── Catalog (strangler shadow) ───────────────────────────────────
 async function loadCatalog() {
   const el = $('catalog-content');
@@ -772,6 +784,7 @@ async function loadCatalog() {
   const dr = await api('/api/catalog/drift'); const drift = (dr&&dr.ok)? await dr.json() : null;
   const fr = await api('/api/flv-status');    const flv   = (fr&&fr.ok)? await fr.json() : null;
   const rr = await api('/api/catalog/readiness'); const ready = (rr&&rr.ok)? await rr.json() : null;
+  const dk = await api('/api/disk-breakdown'); const disk = (dk&&dk.ok)? await dk.json() : null;
 
   const bs = stats.by_state||{}, jobs = stats.jobs||[];
   const backlog = jobs.filter(j=>j.kind==='transcribe'&&j.state==='ready')
@@ -809,6 +822,28 @@ async function loadCatalog() {
       <span style="margin-right:18px;">safe to evict: <b>${(cold.evict_candidates||0).toLocaleString()}</b></span>
       <span>reclaimable: <b>${fmtBytes(cold.reclaimable_bytes)}</b></span></div>
     <div style="font-size:11px;color:#666;margin-top:4px;">verified cloud copy + local copy, &gt;7d old — safe to drop from hot disk (shadow: nothing is evicted)</div>`;
+
+  if (disk && disk.length) {
+    html += `<h3 style="font-size:13px;color:#aaa;margin:18px 0 8px;">Disk usage</h3>`;
+    const ORDER=[['final_mp4','recordings'],['orphan_flv','orphan flv'],['redundant_flv','redundant flv ⚠'],['temp','temp ⚠'],['logs','logs'],['chat','chat'],['transcripts','transcripts'],['other','other']];
+    disk.forEach(d=>{
+      if (d.not_deployed){ html+=`<div style="font-size:12px;color:#888;margin-bottom:6px;">${esc(d.backend_id)}: disk breakdown not deployed — push update</div>`; return; }
+      if (!d.reachable){ html+=`<div style="font-size:12px;color:#a55;margin-bottom:6px;">${esc(d.backend_id)}: unreachable</div>`; return; }
+      const c=d.categories||{}, pct=d.disk_total?Math.round(d.disk_used/d.disk_total*100):0;
+      const pc=pct>=90?'#e0607a':pct>=75?'#e0b070':'#888';
+      html+=`<div style="background:#0d0d0d;border:1px solid #222;border-radius:8px;padding:12px 14px;margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <strong>${esc(d.backend_id)}</strong>
+          <span style="font-size:12px;color:${pc};">${fmtBytes(d.disk_used)} / ${fmtBytes(d.disk_total)} (${pct}%)</span></div>
+        <div style="font-size:12px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px 16px;">
+          ${ORDER.filter(([k])=>c[k]).map(([k,l])=>`<span>${l}: <b>${fmtBytes(c[k])}</b></span>`).join('')}
+          <span style="color:#888;">outside recordings: <b>${fmtBytes(d.outside_recordings_bytes)}</b></span></div>
+        ${d.reclaimable_bytes?`<div style="margin-top:8px;display:flex;align-items:center;gap:10px;">
+          <span style="color:#e0b070;font-size:12px;">↻ ${fmtBytes(d.reclaimable_bytes)} reclaimable (redundant flv + temp)</span>
+          <button class="ghost" style="font-size:11px;padding:3px 10px;" onclick="reapNow('${d.backend_pk}',this)">Reap now</button></div>`:''}
+      </div>`;
+    });
+  }
 
   if (drift && drift.parity) {
     const c = drift.parity.counts||{};
