@@ -45,6 +45,7 @@ def main(argv=None) -> int:
     sub.add_parser("jobs")
     sub.add_parser("scan-jobs")
     sub.add_parser("backlog")
+    sub.add_parser("readiness")
     pr = sub.add_parser("promote", help="Phase 2 go-live: create REAL transcribe jobs")
     pr.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
@@ -90,6 +91,17 @@ def main(argv=None) -> int:
         bl = cat.transcribe_backlog()
         _dump({"backlog": len(bl),
                "sample": [r["filename"] for r in bl[:20]]})
+
+    elif args.cmd == "readiness":
+        from . import readiness as _rd
+        rep = _rd.assess_readiness(cat)
+        for c in rep["checks"]:
+            print(f"  [{'OK ' if c['ok'] else 'XX '}] {c['name']}"
+                  + ("" if c["ok"] else f"  — {c['detail']}"))
+        print(f"\ntranscription cutover ready: {rep['transcription_cutover_ready']}")
+        print(f"eviction ready:              {rep['eviction_ready']}")
+        if rep["blocking"]:
+            print("blocking: " + ", ".join(rep["blocking"]))
 
     elif args.cmd == "promote":
         n = ing.promote_backlog(cat, limit=args.limit)

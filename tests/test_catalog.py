@@ -8,6 +8,7 @@ Run either way:
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -303,6 +304,33 @@ def test_archive_status_and_evict_candidates():
     assert s["cold"]["archived"] == 2              # a and c have cloud copies
     assert s["cold"]["evict_candidates"] == 1
     assert s["cold"]["reclaimable_bytes"] == 100
+
+
+# ---- readiness -----------------------------------------------------------
+
+def test_readiness_gate():
+    cat = _cat()
+    from catalog import readiness, parity
+    cat.upsert_recording(filename="TK_a_2026.05.05_10-00-00.mp4", state="stored", byte_size=100)
+
+    # no parity/compare snapshots yet -> not ready, with blocking reasons
+    rep = readiness.assess_readiness(cat)
+    assert rep["transcription_cutover_ready"] is False
+    assert rep["blocking"]
+
+    # clean parity + a compare snapshot that agrees -> transcription ready
+    parity.compute_parity(cat, [{"filename": "TK_a_2026.05.05_10-00-00.mp4",
+                                 "size_bytes": 100, "store": "sto1"}])
+    cat.meta_set("last_compare", json.dumps({"would_transcribe": 1, "catalog_only": 0}))
+    rep = readiness.assess_readiness(cat)
+    assert rep["transcription_cutover_ready"] is True
+    assert rep["eviction_ready"] is False        # nothing archived yet
+
+    # add a cloud copy -> eviction also ready
+    cat.add_location(cat.find_by_filename("TK_a_2026.05.05_10-00-00.mp4")["id"],
+                     "cloud", "b2", "TK_a.mp4", verified=True)
+    rep = readiness.assess_readiness(cat)
+    assert rep["eviction_ready"] is True
 
 
 # ---- runner --------------------------------------------------------------

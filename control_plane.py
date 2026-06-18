@@ -1298,15 +1298,17 @@ async def _catalog_shadow_loop() -> None:
 
     Creates only shadow jobs — it executes nothing and touches only the separate
     catalog DB. Fully guarded so it can never disturb the running system."""
-    from catalog import ingest as _ing, backfill as _bf
+    from catalog import ingest as _ing, backfill as _bf, parity as _par
     interval = int(os.environ.get("CATALOG_SHADOW_INTERVAL", "900"))
     while True:
         try:
             if _catalog is not None:
                 # Full self-correcting pass: inventory + transcript statuses (R2) +
-                # state reconciliation (R1). Run off the event loop; read-only vs the
-                # fleet and vs control.sqlite (opened mode=ro).
+                # archive/cold status (Phase 3) + state reconciliation (R1). Run off
+                # the event loop; read-only vs the fleet and vs control.sqlite.
                 res = await asyncio.to_thread(_bf.scan_live, _catalog, str(settings.db_path))
+                # Refresh the drift snapshot so the readiness gate has live data.
+                _par.compute_parity(_catalog, res.get("inventory", []))
                 created = _ing.generate_shadow_jobs(_catalog)
                 cmp = _ing.compare_to_live(_catalog, res.get("transcript_statuses", {}))
                 _catalog.meta_set("last_compare", json.dumps(cmp["counts"]))
@@ -3420,6 +3422,16 @@ async def catalog_drift():
         "parity": json.loads(rep) if rep else None,
         "transcribe_compare": json.loads(cmp) if cmp else None,
     }
+
+
+@app.get("/api/catalog/readiness", dependencies=[Depends(require_login)])
+async def catalog_readiness():
+    """Go/no-go for the execute phases (transcription cutover, eviction), from the
+    latest shadow drift + comparison snapshots."""
+    if _catalog is None:
+        raise HTTPException(404, "catalog shadow mode is off (set CATALOG_ENABLED=1)")
+    from catalog import readiness as _rd
+    return _rd.assess_readiness(_catalog)
 
 
 @app.get("/api/flv-status", dependencies=[Depends(require_login)])

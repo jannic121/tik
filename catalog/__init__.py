@@ -6,12 +6,12 @@ its behaviour. See catalog/README.md for the migration plan and how to enable it
 
 from __future__ import annotations
 
-from . import backfill, ingest, parity
+from . import backfill, ingest, parity, readiness
 from .db import Catalog, default_path
 from .names import final_name, parse_recording_name
 
 __all__ = [
     "Catalog", "default_path",
     "parse_recording_name", "final_name",
-    "backfill", "parity", "ingest",
+    "backfill", "parity", "ingest", "readiness",
 ]

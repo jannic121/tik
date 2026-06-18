@@ -771,6 +771,7 @@ async function loadCatalog() {
   if (!stats) { el.innerHTML = '<div class="empty">Catalog not reachable.</div>'; return; }
   const dr = await api('/api/catalog/drift'); const drift = (dr&&dr.ok)? await dr.json() : null;
   const fr = await api('/api/flv-status');    const flv   = (fr&&fr.ok)? await fr.json() : null;
+  const rr = await api('/api/catalog/readiness'); const ready = (rr&&rr.ok)? await rr.json() : null;
 
   const bs = stats.by_state||{}, jobs = stats.jobs||[];
   const backlog = jobs.filter(j=>j.kind==='transcribe'&&j.state==='ready')
@@ -780,7 +781,16 @@ async function loadCatalog() {
     <div style="font-size:22px;font-weight:600;margin-top:4px;">${val}</div>
     ${sub?`<div style="font-size:11px;color:#666;margin-top:2px;">${esc(sub)}</div>`:''}</div>`;
 
-  let html = `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
+  let html = '';
+  if (ready) {
+    const badge=(ok,label)=>`<span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;margin-right:8px;background:${ok?'#16351f':'#3a2a16'};color:${ok?'#7fe0a0':'#e0b070'};border:1px solid ${ok?'#2a5a3a':'#5a4020'};">${ok?'✓':'⏳'} ${label}</span>`;
+    html += `<div style="margin-bottom:16px;">${badge(ready.transcription_cutover_ready,'transcription cutover ready')}${badge(ready.eviction_ready,'eviction ready')}`
+      + ((ready.blocking&&ready.blocking.length)
+         ? `<span style="font-size:12px;color:#888;">blocking: ${ready.blocking.map(esc).join(', ')}</span>`
+         : `<span style="font-size:12px;color:#666;">catalog matches reality — safe to flip when you are</span>`)
+      + `</div>`;
+  }
+  html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
     ${card('Recordings',(stats.recordings||0).toLocaleString(),fmtBytes(stats.bytes))}
     ${card('On hot storage',(bs.stored||0).toLocaleString(),'state: stored')}
     ${card('Evicted',(bs.evicted||0).toLocaleString(),'cleaned off hot disk')}
