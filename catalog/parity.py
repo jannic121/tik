@@ -43,8 +43,11 @@ def compute_parity(cat: Catalog, live_inventory: list[dict]) -> dict:
         elif e["size"] and r["byte_size"] and e["size"] != r["byte_size"]:
             size_mismatch.append({"filename": fn, "live": e["size"], "catalog": r["byte_size"]})
     for fn, r in cat_rows.items():
-        if r["state"] in ("evicted", "missing"):
-            continue                        # legitimately not on hot storage
+        # Only a recording we believe is on hot storage ('stored') counts as drift
+        # if it's absent. 'evicted'/'missing' are legitimately gone; 'recording' is
+        # still in flight (final not written yet); 'discovered' was never confirmed.
+        if r["state"] != "stored":
+            continue
         if fn not in live:
             catalog_missing.append({"filename": fn, "state": r["state"]})
 

@@ -1311,7 +1311,8 @@ async def _catalog_shadow_loop() -> None:
                 _par.compute_parity(_catalog, res.get("inventory", []))
                 created = _ing.generate_shadow_jobs(_catalog)
                 cmp = _ing.compare_to_live(_catalog, res.get("transcript_statuses", {}))
-                _catalog.meta_set("last_compare", json.dumps(cmp["counts"]))
+                _catalog.meta_set("last_compare", json.dumps(
+                    {**cmp["counts"], "catalog_only_sample": cmp["catalog_only"][:25]}))
                 log.info("catalog shadow: backlog=%d transcribed+%d evicted+%d intent+%d",
                          cmp["counts"]["would_transcribe"], res.get("transcribed", 0),
                          res.get("evicted", 0), created)

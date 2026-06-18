@@ -206,16 +206,24 @@ def reconcile_states(cat: Catalog, live_filenames: set) -> dict:
     """R1: a recording marked 'stored' whose .mp4 isn't in the live inventory is no
     longer on hot storage — relabel it 'evicted' so by_state reflects what's
     actually on disk. Non-destructive: nothing is deleted, only the label changes."""
-    evicted = 0
+    evicted = gone = 0
+    # 'stored' not on disk -> evicted (was on hot, now cleaned up).
+    # 'discovered' not on disk -> missing (a past failed/pending transfer that
+    # never landed). Both stop them polluting drift; 'recording' (in flight) is
+    # left alone since its final file isn't written yet.
     rows = cat.conn.execute(
-        "SELECT id, filename FROM recordings WHERE state='stored'").fetchall()
+        "SELECT id, filename, state FROM recordings WHERE state IN ('stored','discovered')"
+    ).fetchall()
     for r in rows:
-        if r["filename"] not in live_filenames:
-            cat.set_state(r["id"], "evicted")
-            # No local copy → can't be transcribed here; drop any stale transcribe job.
-            cat.cancel_open_jobs(r["id"], "transcribe")
-            evicted += 1
-    return {"evicted": evicted}
+        if r["filename"] in live_filenames:
+            continue
+        if r["state"] == "stored":
+            cat.set_state(r["id"], "evicted"); evicted += 1
+        else:
+            cat.set_state(r["id"], "missing"); gone += 1
+        # No local copy → can't be transcribed here; drop any stale transcribe job.
+        cat.cancel_open_jobs(r["id"], "transcribe")
+    return {"evicted": evicted, "missing": gone}
 
 
 def collect_archive_status(control_db: str | Path) -> dict:

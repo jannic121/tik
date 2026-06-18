@@ -237,10 +237,13 @@ def test_reconcile_evicts_absent():
     cat = _cat()
     a = cat.upsert_recording(filename="TK_a_2026.06.05_10-00-00.mp4", state="stored")
     b = cat.upsert_recording(filename="TK_b_2026.06.05_11-00-00.mp4", state="stored")
+    # a discovered recording that never landed should reconcile to 'missing'
+    d = cat.upsert_recording(filename="TK_d_2026.06.05_12-00-00.mp4", state="discovered")
     out = backfill.reconcile_states(cat, {"TK_a_2026.06.05_10-00-00.mp4"})  # only a is live
-    assert out["evicted"] == 1
+    assert out["evicted"] == 1 and out["missing"] == 1
     assert cat.get_recording(a)["state"] == "stored"
     assert cat.get_recording(b)["state"] == "evicted"
+    assert cat.get_recording(d)["state"] == "missing"
 
 
 # ---- R2: transcript statuses ---------------------------------------------
