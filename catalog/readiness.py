@@ -23,40 +23,50 @@ def assess_readiness(cat: Catalog) -> dict:
     compare = cat.meta_get("last_compare")
     compare = json.loads(compare) if compare else None
     stats = cat.stats()
-
-    checks: list[dict] = []
-
-    def chk(name: str, ok: bool, detail: str) -> None:
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
-
-    if parity:
-        c = parity.get("counts", {})
-        chk("no untracked files on disk", c.get("live_only", 0) == 0,
-            f"{c.get('live_only', 0)} live_only")
-        chk("no tracked recordings missing from disk", c.get("catalog_missing", 0) == 0,
-            f"{c.get('catalog_missing', 0)} catalog_missing")
-        chk("no size mismatches", c.get("size_mismatch", 0) == 0,
-            f"{c.get('size_mismatch', 0)} size_mismatch")
-    else:
-        chk("parity has run", False,
-            "no parity snapshot yet — run `python -m catalog parity` or wait for a shadow pass")
-
-    if compare is not None:
-        # The accuracy check: files the worker already transcribed that the catalog
-        # still lists as pending. That means R2 isn't seeing some transcripts —
-        # usually a storage server that isn't registered. (catalog_only, by
-        # contrast, is mostly normal pipeline lag and is NOT a blocker.)
-        stale = compare.get("already_done_live", 0)
-        chk("transcript tracking is current with the worker", stale == 0,
-            f"{stale} files the worker already transcribed are still listed pending "
-            f"(a storage/transcription server may not be registered)")
-    else:
-        chk("transcribe comparison has run", False, "no comparison snapshot yet")
-
     cold = stats.get("cold", {})
-    transcription_ready = all(c["ok"] for c in checks)
-    # Eviction additionally needs at least one verified cloud copy to evict toward.
-    eviction_ready = transcription_ready and cold.get("archived", 0) > 0
+
+    pc = (parity or {}).get("counts", {})
+    have_parity = parity is not None
+    have_compare = compare is not None
+    live_only = pc.get("live_only", 0)
+    catalog_missing = pc.get("catalog_missing", 0)
+    size_mismatch = pc.get("size_mismatch", 0)
+    # Files the worker already transcribed that the catalog still lists pending —
+    # an actual tracking gap (usually an unregistered storage server). catalog_only
+    # (files not yet shipped to the transcription box) is normal lag, NOT a blocker.
+    stale = (compare or {}).get("already_done_live", 0)
+
+    checks = [
+        {"name": "parity has run", "phase": "both", "ok": have_parity,
+         "detail": "" if have_parity else "run `python -m catalog parity` or wait for a shadow pass"},
+        {"name": "transcript tracking is current with the worker", "phase": "transcription",
+         "ok": have_compare and stale == 0,
+         "detail": "" if (have_compare and stale == 0) else
+         f"{stale} files the worker already transcribed are still listed pending "
+         f"(register the storage server holding those transcripts)"},
+        {"name": "catalog knows every stored recording", "phase": "transcription",
+         "ok": have_parity and catalog_missing == 0,
+         "detail": "" if catalog_missing == 0 else f"{catalog_missing} catalog_missing"},
+        {"name": "no untracked files on disk", "phase": "eviction",
+         "ok": have_parity and live_only == 0,
+         "detail": "" if live_only == 0 else f"{live_only} live_only (usually a file mid-record)"},
+        {"name": "no size mismatches", "phase": "eviction",
+         "ok": have_parity and size_mismatch == 0,
+         "detail": "" if size_mismatch == 0 else f"{size_mismatch} size_mismatch (usually a file mid-record)"},
+    ]
+
+    # Transcription cutover only needs accurate TRACKING (transcripts current, no
+    # lost recordings). Eviction DELETES, so it additionally needs the on-disk
+    # inventory to match exactly AND somewhere (cloud) to have evicted toward.
+    transcription_ready = have_parity and have_compare and stale == 0 and catalog_missing == 0
+    eviction_ready = (transcription_ready and live_only == 0 and size_mismatch == 0
+                      and cold.get("archived", 0) > 0)
+
+    blk_t = [c["name"] for c in checks
+             if c["phase"] in ("transcription", "both") and not c["ok"]]
+    blk_e = [c["name"] for c in checks if not c["ok"]]
+    if not (cold.get("archived", 0) > 0):
+        blk_e.append("nothing archived to cloud yet")
 
     backlog = next((s["count"] for s in stats.get("jobs", [])
                     if s.get("kind") == "transcribe" and s.get("state") == "ready"), 0)
@@ -65,7 +75,9 @@ def assess_readiness(cat: Catalog) -> dict:
         "transcription_cutover_ready": transcription_ready,
         "eviction_ready": eviction_ready,
         "checks": checks,
-        "blocking": [c["name"] for c in checks if not c["ok"]],
+        "blocking_transcription": blk_t,
+        "blocking_eviction": blk_e,
+        "blocking": blk_t if not transcription_ready else blk_e,
         "summary": {
             "recordings": stats.get("recordings"),
             "transcribe_backlog": backlog,
