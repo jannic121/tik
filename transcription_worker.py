@@ -120,6 +120,18 @@ class Settings:
     archive_what: str     = os.environ.get("ARCHIVE_WHAT", "mp4").strip()   # mp4|txt|both
     archive_delete_local: bool = os.environ.get("ARCHIVE_DELETE_LOCAL", "0") == "1"
     archive_delete_delay_sec: int = int(os.environ.get("ARCHIVE_DELETE_DELAY_SEC", "0"))
+    # Disk-aware eviction: instead of deleting every archived file after a fixed
+    # delay, keep recordings hot and only evict (delete the verified-on-cloud local
+    # copy) once disk usage crosses the high-water mark — oldest first, down to the
+    # low-water mark. Files younger than the min-age are always kept hot.
+    archive_evict_high_pct: float  = float(os.environ.get("ARCHIVE_EVICT_HIGH_PCT", "85"))
+    archive_evict_low_pct: float   = float(os.environ.get("ARCHIVE_EVICT_LOW_PCT", "70"))
+    archive_evict_min_age_sec: int = int(os.environ.get("ARCHIVE_EVICT_MIN_AGE_SEC", "86400"))
+    # rclone throughput: parallel transfers and an optional bandwidth cap (e.g.
+    # "10M"); empty = unlimited. Plus per-file archive retry backoff.
+    archive_transfers: int = max(1, int(os.environ.get("ARCHIVE_TRANSFERS", "4")))
+    archive_bwlimit: str   = os.environ.get("ARCHIVE_BWLIMIT", "").strip()
+    archive_retry_backoff_sec: int = int(os.environ.get("ARCHIVE_RETRY_BACKOFF", "120"))
 
 
 settings = Settings()
@@ -441,6 +453,9 @@ class TranscriptionWorker:
         self._gave_up_count: int = 0             # files with a .error marker (cached)
         self._archived:  list[dict] = []   # recent successful archives
         self._archive_failed: list[dict] = []
+        self._archive_attempts: dict[str, int] = {}     # filename → failed attempts
+        self._archive_retry_after: dict[str, float] = {} # filename → earliest next try
+        self._last_evict: dict = {}                      # last disk-pressure eviction
 
     # ── file paths ───────────────────────────────────────────────────────────
 
@@ -585,9 +600,19 @@ class TranscriptionWorker:
 
         username = mp4.parent.name
         dest = f"{settings.archive_remote.rstrip('/')}/{username}/"
+        args = ["--transfers", str(settings.archive_transfers)]
+        if settings.archive_bwlimit:
+            args += ["--bwlimit", settings.archive_bwlimit]
+
+        def _copy(src: str, dst: str) -> None:
+            try:
+                rclone.copy(src, dst, show_progress=False, args=args)
+            except TypeError:                    # older rclone-python without args/kwargs
+                rclone.copy(src, dst)
+
         try:
             for f in self._archive_targets(mp4):
-                rclone.copy(str(f), dest)        # checksum-verified by rclone
+                _copy(str(f), dest)              # checksum-verified by rclone
             marker = self._archived_marker(mp4)
             marker.write_text(f"archived_at={time.time()} remote={dest}\n")
             self._archived.insert(0, {"filename": mp4.name, "remote": dest,
@@ -604,54 +629,111 @@ class TranscriptionWorker:
             return False
 
     def _remote_has(self, mp4: Path) -> bool:
-        """Verify the mp4 is present on the remote before deleting the local copy."""
+        """Verify the mp4 is present on the remote (and the same size, when the
+        listing reports it) before deleting the local copy."""
         try:
             from rclone_python import rclone
             username = mp4.parent.name
             listing = rclone.ls(f"{settings.archive_remote.rstrip('/')}/{username}/")
-            names = {item.get("Name") for item in listing} if listing else set()
-            return mp4.name in names
+            for item in (listing or []):
+                if item.get("Name") != mp4.name:
+                    continue
+                size = item.get("Size")
+                try:
+                    return size is None or int(size) == mp4.stat().st_size
+                except (OSError, ValueError, TypeError):
+                    return True                  # name matches; can't compare size
+            return False
         except Exception as e:
             log.warning("archive verify failed for %s: %s", mp4.name, e)
             return False
 
-    def archive_sweep(self) -> None:
-        """Archive transcribed-but-unarchived files, and (optionally) delete the
-        local mp4 once it's been archived and re-verified on the remote."""
-        if not settings.archive_remote or not settings.watch_dir.exists():
+    def _archive_with_backoff(self, f: Path, now: float) -> None:
+        """Archive one file, honouring a per-file exponential backoff so a
+        persistently-failing file (auth/network) stops being retried every scan."""
+        name = f.name
+        if self._archive_retry_after.get(name, 0) > now:
             return
-        # Chat logs: archive as soon as they exist (no transcription gate).
-        # We never auto-delete chat logs locally — they're tiny.
-        for chat in sorted(settings.watch_dir.rglob("*_chat.jsonl")):
-            if not self._archived_marker(chat).exists():
-                self.archive_one(chat)
-        for mp4 in sorted(settings.watch_dir.rglob("*.mp4")):
-            marker = self._archived_marker(mp4)
-            # Only archive files that have been transcribed (have a .txt)
-            if not marker.exists():
-                if self._txt(mp4).exists():
-                    self.archive_one(mp4)
+        if self.archive_one(f):
+            self._archive_attempts.pop(name, None)
+            self._archive_retry_after.pop(name, None)
+        else:
+            a = self._archive_attempts.get(name, 0) + 1
+            self._archive_attempts[name] = a
+            backoff = min(3600, settings.archive_retry_backoff_sec * (2 ** (a - 1)))
+            self._archive_retry_after[name] = now + backoff
+
+    def _evict_if_pressured(self) -> None:
+        """Disk-aware eviction. Only when usage crosses the high-water mark, delete
+        the verified-on-cloud local copies of the OLDEST archived recordings until
+        usage drops to the low-water mark. Files younger than the min-age are kept
+        hot. Never deletes a file not confirmed present on the remote."""
+        if not settings.archive_delete_local:
+            return
+        try:
+            du = shutil.disk_usage(settings.watch_dir)
+        except Exception:
+            return
+        used_pct = 100 * (1 - du.free / du.total) if du.total else 0.0
+        if used_pct < settings.archive_evict_high_pct:
+            return                              # plenty of room — keep everything hot
+        now = time.time()
+        min_age = max(settings.archive_delete_delay_sec, settings.archive_evict_min_age_sec)
+        cands: list[tuple[float, Path]] = []
+        for mp4 in settings.watch_dir.rglob("*.mp4"):
+            if mp4.name.endswith("_flv.mp4"):
                 continue
-            # Already archived — handle optional local deletion
-            if not settings.archive_delete_local:
+            marker = self._archived_marker(mp4)
+            if not marker.exists():
                 continue
             try:
-                archived_at = marker.stat().st_mtime
+                if (now - marker.stat().st_mtime) < min_age:
+                    continue                    # still hot
+                cands.append((mp4.stat().st_mtime, mp4))
             except OSError:
                 continue
-            if (time.time() - archived_at) < settings.archive_delete_delay_sec:
+        cands.sort()                            # oldest recording first
+        target_free = du.total * (1 - settings.archive_evict_low_pct / 100)
+        freed = evicted = 0
+        for _, mp4 in cands:
+            if (du.free + freed) >= target_free:
+                break                           # back under the low-water mark
+            if not self._remote_has(mp4):
+                continue                        # not confirmed on cloud — never delete
+            try:
+                sz = mp4.stat().st_size
+                mp4.unlink()
+                freed += sz
+                evicted += 1
+                log.info("evict: removed local %s (disk %.0f%%, on remote)",
+                         mp4.name, used_pct)
+            except OSError as e:
+                log.warning("evict: could not delete %s: %s", mp4.name, e)
+        if evicted:
+            log.info("evict: freed %s across %d file(s) (disk was %.0f%%)",
+                     f"{freed:,}", evicted, used_pct)
+        self._last_evict = {"at": now, "evicted": evicted, "freed_bytes": freed,
+                            "disk_pct_before": round(used_pct, 1)}
+
+    def archive_sweep(self) -> None:
+        """Archive transcribed-but-unarchived files (with per-file backoff), then
+        evict cold local copies if the disk is under pressure. Runs in a worker
+        thread (see scan_loop) so a slow upload never blocks the event loop."""
+        if not settings.archive_remote or not settings.watch_dir.exists():
+            return
+        now = time.time()
+        # Chat logs: archive as soon as they exist; never auto-evicted (tiny).
+        for chat in sorted(settings.watch_dir.rglob("*_chat.jsonl")):
+            if not self._archived_marker(chat).exists():
+                self._archive_with_backoff(chat, now)
+        # Recordings: archive once transcribed (have a .txt).
+        for mp4 in sorted(settings.watch_dir.rglob("*.mp4")):
+            if self._archived_marker(mp4).exists():
                 continue
-            # Re-verify on the remote, then delete ONLY the local mp4 (keep .txt
-            # so transcript search still works locally).
-            if self._remote_has(mp4):
-                try:
-                    mp4.unlink()
-                    log.info("archive: deleted local copy of %s (on remote)", mp4.name)
-                except OSError as e:
-                    log.warning("archive: could not delete local %s: %s", mp4.name, e)
-            else:
-                log.warning("archive: %s not confirmed on remote; keeping local copy",
-                            mp4.name)
+            if self._txt(mp4).exists():
+                self._archive_with_backoff(mp4, now)
+        # Keep hot / evict cold under disk pressure.
+        self._evict_if_pressured()
 
     def _record_failure(self, mp4: Path, fname: str, rc, final: dict,
                         attempt: int, err_path=None):
@@ -853,9 +935,11 @@ class TranscriptionWorker:
                     log.info("Enqueued %d file(s) for transcription", n)
             except Exception:
                 log.exception("scan error")
-            # 3rd-hop archive sweep (no-op unless ARCHIVE_REMOTE is set)
+            # 3rd-hop archive sweep (no-op unless ARCHIVE_REMOTE is set). Run off
+            # the event loop so a large/slow rclone upload can't block health
+            # checks, file receives, or transcription monitoring.
             try:
-                self.archive_sweep()
+                await asyncio.to_thread(self.archive_sweep)
             except Exception:
                 log.exception("archive sweep error")
             await asyncio.sleep(settings.scan_interval)
@@ -941,6 +1025,8 @@ class TranscriptionWorker:
             "archive_delete_local": settings.archive_delete_local if settings.archive_remote else None,
             "archived_count":    len(self._archived),
             "archive_failed_count": len(self._archive_failed),
+            "archive_evict_high_pct": settings.archive_evict_high_pct if settings.archive_remote else None,
+            "last_evict":        self._last_evict or None,
         }
 
 

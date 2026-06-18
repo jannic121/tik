@@ -131,8 +131,16 @@ WHISPER_FILE_TIMEOUT=0
 # 2) Set ARCHIVE_REMOTE below to "<remote>:<path>" and restart the service.
 # ARCHIVE_REMOTE=dropbox:tt-recordings
 # ARCHIVE_WHAT=mp4                 # mp4 | txt | both
-# ARCHIVE_DELETE_LOCAL=0           # 1 = delete local copy after verified upload
-# ARCHIVE_DELETE_DELAY_SEC=0       # wait this long after archive before deleting
+# ARCHIVE_DELETE_LOCAL=0           # 1 = enable disk-aware eviction of archived copies
+# Disk-aware eviction (when ARCHIVE_DELETE_LOCAL=1): keep recordings hot and only
+# delete verified-on-cloud copies once the disk is under pressure — oldest first.
+# ARCHIVE_EVICT_HIGH_PCT=85        # start evicting above this disk usage %
+# ARCHIVE_EVICT_LOW_PCT=70         # evict down to this %
+# ARCHIVE_EVICT_MIN_AGE_SEC=86400  # never evict a file younger than this (kept hot)
+# rclone throughput + retry tuning:
+# ARCHIVE_TRANSFERS=4              # parallel transfers rclone uses
+# ARCHIVE_BWLIMIT=                 # cap, e.g. "10M"; empty = unlimited
+# ARCHIVE_RETRY_BACKOFF=120        # base seconds between archive retries (doubles)
 EOF
   chmod 0600 $ENV_FILE
   chown root:$SERVICE_USER $ENV_FILE
