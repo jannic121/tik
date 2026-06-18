@@ -42,10 +42,14 @@ def assess_readiness(cat: Catalog) -> dict:
             "no parity snapshot yet — run `python -m catalog parity` or wait for a shadow pass")
 
     if compare is not None:
-        catalog_only = compare.get("catalog_only", 0)
-        chk("transcribe view agrees with the live worker", catalog_only == 0,
-            f"{catalog_only} catalog_only (catalog would transcribe files the live "
-            f"worker doesn't know about)")
+        # The accuracy check: files the worker already transcribed that the catalog
+        # still lists as pending. That means R2 isn't seeing some transcripts —
+        # usually a storage server that isn't registered. (catalog_only, by
+        # contrast, is mostly normal pipeline lag and is NOT a blocker.)
+        stale = compare.get("already_done_live", 0)
+        chk("transcript tracking is current with the worker", stale == 0,
+            f"{stale} files the worker already transcribed are still listed pending "
+            f"(a storage/transcription server may not be registered)")
     else:
         chk("transcribe comparison has run", False, "no comparison snapshot yet")
 
