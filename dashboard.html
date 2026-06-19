@@ -241,9 +241,9 @@
           <option value="0">Off — storage-only (receive/serve/move, no transcription)</option>
         </select>
       </label>
-      <div style="border-top:1px solid #2a2a2a;margin:12px 0 8px;padding-top:8px;">
-        <div style="font-size:12px;color:#aaa;margin-bottom:4px;">SSH (to update the env file & restart the worker)</div>
-        <div style="display:flex;gap:8px;">
+      <details id="wcfg-ssh-details" style="border-top:1px solid #2a2a2a;margin:12px 0 8px;padding-top:8px;">
+        <summary style="cursor:pointer;font-size:12px;color:#aaa;">SSH <span class="dim">— saved after first connect; expand to set or change</span></summary>
+        <div style="display:flex;gap:8px;margin-top:8px;">
           <label style="flex:1;font-size:11px;color:#888;">User<input id="wcfg-ssh-user" value="root"/></label>
           <label style="width:80px;font-size:11px;color:#888;">Port<input id="wcfg-ssh-port" value="22"/></label>
           <label style="width:110px;font-size:11px;color:#888;">Auth
@@ -254,7 +254,7 @@
         <label id="wcfg-ssh-key-l" style="font-size:11px;color:#888;">Key path<input id="wcfg-ssh-key" value="~/.ssh/id_ed25519"/></label>
         <label id="wcfg-ssh-pw-l" style="display:none;font-size:11px;color:#888;">Password<input id="wcfg-ssh-pw" type="password"/></label>
         <span class="dim" style="font-size:11px;">Saved per host — leave blank to reuse the last credentials for this server.</span>
-      </div>
+      </details>
       <pre id="wcfg-out" style="display:none;background:#0e0e0e;border:1px solid #2a2a2a;border-radius:6px;padding:8px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap;font-size:11px;"></pre>
       <div class="btn-row">
         <button class="cancel" onclick="closeModal('modal-wcfg')">Cancel</button>
@@ -281,6 +281,14 @@
         <button type="button" class="toggle" onclick="stTogglePw()">show</button>
       </div>
     </label>
+    <details style="margin-top:10px;border:1px solid #2a2a2a;border-radius:6px;padding:6px 12px;">
+      <summary style="cursor:pointer;font-size:12px;color:#9aa;">SSH endpoint
+        <span class="dim">— optional; set if it differs from the URL host (e.g. behind NAT on a custom SSH port)</span></summary>
+      <div class="row2" style="margin-top:8px;">
+        <label style="font-size:12px;">SSH host<input id="st-ssh-host" placeholder="defaults to the URL host"/></label>
+        <label style="font-size:12px;">SSH port<input id="st-ssh-port" type="number" placeholder="22"/></label>
+      </div>
+    </details>
     <div style="display:flex;gap:8px;margin-top:12px;">
       <button class="primary" onclick="saveStorage()" style="flex:1;">Add &amp; test</button>
     </div>
@@ -519,18 +527,23 @@
       <label>Bandwidth cap (optional)<input id="ar-bwlimit" placeholder="e.g. 10M — blank = unlimited"/></label>
     </div>
 
-    <h3 style="margin:16px 0 6px;font-size:13px;">SSH to the storage server</h3>
-    <div class="row2">
-      <label>SSH user<input id="ar-ssh-user" value="root"/></label>
-      <label>SSH port<input id="ar-ssh-port" type="number" value="22"/></label>
-    </div>
-    <label>Auth method
-      <select id="ar-ssh-auth" onchange="$('ar-ssh-pw-l').style.display=this.value==='password'?'':'none';$('ar-ssh-key-l').style.display=this.value==='key'?'':'none';">
-        <option value="key">SSH key</option><option value="password">Password</option>
-      </select>
-    </label>
-    <label id="ar-ssh-key-l">Private key path<input id="ar-ssh-key" placeholder="~/.ssh/id_rsa"/></label>
-    <label id="ar-ssh-pw-l" style="display:none;">Password<input id="ar-ssh-pw" type="password"/></label>
+    <details id="ar-ssh-details" class="ssh-details" style="margin-top:14px;border:1px solid #2a2a2a;border-radius:6px;padding:6px 12px;">
+      <summary style="cursor:pointer;font-size:13px;color:#9aa;">SSH to the storage server
+        <span class="dim">— saved after first connect; expand only to set or change it</span></summary>
+      <div style="margin-top:8px;">
+        <div class="row2">
+          <label>SSH user<input id="ar-ssh-user" value="root"/></label>
+          <label>SSH port<input id="ar-ssh-port" type="number" value="22"/></label>
+        </div>
+        <label>Auth method
+          <select id="ar-ssh-auth" onchange="$('ar-ssh-pw-l').style.display=this.value==='password'?'':'none';$('ar-ssh-key-l').style.display=this.value==='key'?'':'none';">
+            <option value="key">SSH key</option><option value="password">Password</option>
+          </select>
+        </label>
+        <label id="ar-ssh-key-l">Private key path<input id="ar-ssh-key" placeholder="~/.ssh/id_rsa"/></label>
+        <label id="ar-ssh-pw-l" style="display:none;">Password<input id="ar-ssh-pw" type="password"/></label>
+      </div>
+    </details>
 
     <div style="display:flex;gap:8px;margin-top:14px;">
       <button class="primary" id="ar-btn" onclick="enableArchive()">Configure &amp; enable</button>
@@ -708,6 +721,14 @@
     <label>Auth token
       <input id="b-token" placeholder="AUTH_TOKEN from /etc/tt-backend.env" />
     </label>
+    <details style="margin:8px 0;border:1px solid #2a2a2a;border-radius:6px;padding:6px 12px;">
+      <summary style="cursor:pointer;font-size:12px;color:#9aa;">SSH endpoint
+        <span class="dim">— optional; set if it differs from the URL host (e.g. behind NAT on a custom SSH port)</span></summary>
+      <div class="row2" style="margin-top:8px;">
+        <label style="font-size:12px;">SSH host<input id="b-ssh-host" placeholder="defaults to the URL host"/></label>
+        <label style="font-size:12px;">SSH port<input id="b-ssh-port" type="number" placeholder="22"/></label>
+      </div>
+    </details>
     <p style="font-size:12px;color:#777;margin:0 0 4px;">
       Probes /health and /watchers before saving.</p>
     <div class="modal-err" id="b-err"></div>
@@ -1004,6 +1025,8 @@ function closeModal(id) { $(id).classList.remove('show'); }
 function openAddBackend(prefillUrl='', prefillToken='') {
   $('b-url').value = prefillUrl;
   $('b-token').value = prefillToken;
+  if($('b-ssh-host')) $('b-ssh-host').value='';
+  if($('b-ssh-port')) $('b-ssh-port').value='';
   $('b-err').textContent = '';
   openModal('modal-backend');
   $('b-url').focus();
@@ -1013,7 +1036,10 @@ async function submitBackend() {
   $('b-err').textContent='';
   const url=$('b-url').value.trim(), token=$('b-token').value.trim();
   if (!url||!token){$('b-err').textContent='URL and token required';return;}
-  const r=await api('/api/backends',{method:'POST',body:JSON.stringify({url,auth_token:token})});
+  const sshHost=($('b-ssh-host')?.value||'').trim();
+  const sshPort=parseInt($('b-ssh-port')?.value||'',10);
+  const r=await api('/api/backends',{method:'POST',body:JSON.stringify(
+    {url,auth_token:token,ssh_host:sshHost||null,ssh_port:sshPort||null})});
   if (!r) return;
   if (r.ok){closeModal('modal-backend');loadBackends();return;}
   const e=await r.json().catch(()=>({}));
@@ -2350,7 +2376,7 @@ function pickArchiveServer(sid) {
   $('archive-config')?.scrollIntoView({behavior:'smooth', block:'start'});
 }
 
-function onArchiveServerSelect() {
+async function onArchiveServerSelect() {
   const sid = $('ar-server') ? $('ar-server').value : '';
   const cur = $('ar-current');
   if (!cur) return;
@@ -2358,6 +2384,15 @@ function onArchiveServerSelect() {
   cur.innerHTML = (s && s.configured)
     ? `Currently archiving to <span class="mono">${esc(s.remote)}</span> (${s.archived_count||0} archived).`
     : 'Archiving not configured on this server yet.';
+  // Expand the SSH section only on first connect (no saved creds for this host).
+  const det = $('ar-ssh-details');
+  if (det && s) {
+    try {
+      const host = new URL(s.url).hostname;
+      const sc = await (await api('/api/ssh-creds/'+encodeURIComponent(host))).json();
+      det.open = !(sc && sc.exists);
+    } catch(_) { det.open = true; }
+  }
 }
 
 async function _streamArchive(url, body, btn, label) {
@@ -2506,7 +2541,8 @@ async function openWorkerConfig(sid) {
     $('wcfg-ssh-port').value=sc.ssh_port||22;
     $('wcfg-ssh-auth').value=sc.auth_method||'key';
     $('wcfg-ssh-key').value=sc.key_path||'~/.ssh/id_ed25519';
-  } catch(_){}
+    if($('wcfg-ssh-details')) $('wcfg-ssh-details').open = !(sc && sc.exists);
+  } catch(_){ if($('wcfg-ssh-details')) $('wcfg-ssh-details').open=true; }
   $('wcfg-ssh-pw-l').style.display=$('wcfg-ssh-auth').value==='password'?'':'none';
   $('wcfg-ssh-key-l').style.display=$('wcfg-ssh-auth').value==='key'?'':'none';
   openModal('modal-wcfg');
@@ -2547,8 +2583,12 @@ async function saveStorage() {
     s.style.color = '#f99'; s.textContent = 'URL and token are both required.'; return;
   }
   s.style.color = '#9aa'; s.textContent = 'Adding and testing connection…';
-  const r = await api(`/api/storage?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`,
-    {method:'POST'});
+  const sshHost = ($('st-ssh-host')?.value||'').trim();
+  const sshPort = parseInt($('st-ssh-port')?.value||'',10);
+  let q = `/api/storage?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`;
+  if (sshHost) q += `&ssh_host=${encodeURIComponent(sshHost)}`;
+  if (sshPort) q += `&ssh_port=${sshPort}`;
+  const r = await api(q, {method:'POST'});
   if (r && r.ok) {
     const d = await r.json();
     s.style.color = d.reachable ? '#6ee7a7' : '#fc6';
@@ -2722,7 +2762,7 @@ async function runDeploy() {
       if (m) {
         const url = `http://${host}:8090`;
         showResult('Storage server deployed', 'Registering transcript worker...');
-        await autoRegisterStorage(url, m[1]);
+        await autoRegisterStorage(url, m[1], host, parseInt($('d-port').value,10));
       }
     } else {
       const m = buf.match(/AUTH_TOKEN:\s*([0-9a-f]{64})/);
@@ -2730,7 +2770,7 @@ async function runDeploy() {
       if (m) {
         const label = bid ? bid[1] : host;
         showResult(`Recorder backend deployed (${label})`, 'Registering backend...');
-        await autoRegisterBackend(host, m[1]);
+        await autoRegisterBackend(host, m[1], host, parseInt($('d-port').value,10));
       }
     }
   } catch(e) {
@@ -2748,13 +2788,13 @@ function showResult(title, statusText) {
   $('d-result').scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
-async function autoRegisterBackend(host, token) {
+async function autoRegisterBackend(host, token, sshHost, sshPort) {
   const url = `http://${host}:8000`;
   for (let attempt = 1; attempt <= 5; attempt++) {
     $('d-result-status').textContent = `Registering backend... (attempt ${attempt}/5)`;
     const r = await api('/api/backends', {
       method: 'POST',
-      body: JSON.stringify({url, auth_token: token}),
+      body: JSON.stringify({url, auth_token: token, ssh_host: sshHost||null, ssh_port: sshPort||null}),
     });
     if (r && r.ok) {
       $('d-result-status').style.color = '#6ee7a7';
@@ -2768,11 +2808,13 @@ async function autoRegisterBackend(host, token) {
   $('d-result-status').textContent = 'Auto-register failed — add manually in Backends tab.';
 }
 
-async function autoRegisterStorage(url, token) {
+async function autoRegisterStorage(url, token, sshHost, sshPort) {
   $('d-result-status').textContent = 'Registering transcript worker...';
   try {
-    const r = await api(`/api/config/transcript-worker?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`,
-      {method: 'POST'});
+    let q = `/api/storage?url=${encodeURIComponent(url)}&token=${encodeURIComponent(token)}`;
+    if (sshHost) q += `&ssh_host=${encodeURIComponent(sshHost)}`;
+    if (sshPort) q += `&ssh_port=${sshPort}`;
+    const r = await api(q, {method: 'POST'});
     if (r && r.ok) {
       const data = await r.json();
       $('d-result-status').style.color = '#6ee7a7';

@@ -241,6 +241,13 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _add_col("storage_servers", "last_transcribe", "INTEGER")
     _add_col("storage_servers", "last_vad", "INTEGER")
     _add_col("storage_servers", "last_beam", "INTEGER")
+    # Per-server SSH endpoint, so two machines behind one public IP (distinguished
+    # only by a forwarded SSH port) are tracked independently for deploy/updates.
+    # NULL = legacy/default: SSH host = the service URL's host, SSH port = 22.
+    _add_col("backends", "ssh_host", "TEXT")
+    _add_col("backends", "ssh_port", "INTEGER")
+    _add_col("storage_servers", "ssh_host", "TEXT")
+    _add_col("storage_servers", "ssh_port", "INTEGER")
     conn.commit()
 
 
@@ -405,6 +412,34 @@ def _host_of(url: str) -> Optional[str]:
         return None
 
 
+def _mkey(host: Optional[str], port) -> str:
+    """Canonical machine key for SSH creds + Updates grouping. Including the SSH
+    port lets two servers behind one public IP be tracked as distinct machines."""
+    try:
+        p = int(port) if port else 22
+    except (TypeError, ValueError):
+        p = 22
+    return f"{host or ''}:{p}"
+
+
+def _ssh_target(row) -> tuple:
+    """(ssh_host, ssh_port) for a backend/storage row, falling back to the service
+    URL's host and port 22 when the explicit SSH endpoint isn't set."""
+    keys = row.keys() if hasattr(row, "keys") else row
+    sh = (row["ssh_host"] if "ssh_host" in keys and row["ssh_host"] else _host_of(row["url"]))
+    sp = (row["ssh_port"] if "ssh_port" in keys and row["ssh_port"] else None) or 22
+    return sh, sp
+
+
+def _get_creds_mkey(host: Optional[str], port) -> Optional[dict]:
+    """Saved creds for a machine. Tries the host:port key, then (for port 22)
+    falls back to the legacy bare-host key so existing installs keep their creds."""
+    g = _get_ssh_creds(_mkey(host, port))
+    if not g and int(port or 22) == 22:
+        g = _get_ssh_creds(host)
+    return g
+
+
 def _get_ssh_creds(host: str) -> Optional[dict]:
     if not host:
         return None
@@ -481,23 +516,35 @@ def _threaded_stream(work, media_type: str = "text/plain; charset=utf-8"):
 
 def _resolve_ssh(host: str, port: int, user: str, auth_method: str,
                  password: Optional[str], key_path: Optional[str]) -> tuple:
-    """Merge supplied SSH params with anything stored for the host, then persist
-    the result. A blank password/key falls back to the saved one."""
-    stored = _get_ssh_creds(host) or {}
+    """Merge supplied SSH params with anything stored for the machine, then persist
+    the result keyed by host:port. A blank password/key falls back to the saved one.
+    The port is authoritative from the caller (form/record) — it identifies the
+    machine — so it is not overridden by saved creds."""
+    port = port or 22
+    stored = _get_creds_mkey(host, port) or {}
     user = user or stored.get("ssh_user") or "root"
-    port = port or stored.get("ssh_port") or 22
     auth_method = auth_method or stored.get("auth_method") or "key"
     if not password and auth_method == "password":
         password = _decrypt_pw(stored.get("password_enc"))
     if not key_path and auth_method == "key":
         key_path = stored.get("key_path")
-    _save_ssh_creds(host, user, port, auth_method, password, key_path)
+    _save_ssh_creds(_mkey(host, port), user, port, auth_method, password, key_path)
     return port, user, auth_method, password, key_path
 
 
-def _ssh_creds_summary(host: str) -> dict:
-    """Non-secret view for prefilling the UI (never returns the password)."""
-    g = _get_ssh_creds(host) or {}
+def _ssh_creds_summary(host: str, port=None) -> dict:
+    """Non-secret view for prefilling/collapsing the UI (never returns the password).
+    With a port, looks up the exact machine; without one, returns the most recent
+    saved creds for the host on ANY SSH port (so the UI can collapse on host alone)."""
+    if port:
+        g = _get_creds_mkey(host, port) or {}
+    else:
+        with sqlite3.connect(settings.db_path, timeout=10) as c:
+            c.row_factory = sqlite3.Row
+            r = c.execute("SELECT * FROM ssh_creds WHERE host=? OR host LIKE ? "
+                          "ORDER BY updated_at DESC LIMIT 1",
+                          (host, f"{host}:%")).fetchone()
+        g = dict(r) if r else {}
     return {"host": host, "exists": bool(g),
             "ssh_user": g.get("ssh_user") or "root",
             "ssh_port": g.get("ssh_port") or 22,
@@ -539,6 +586,8 @@ class LoginRequest(BaseModel):
 class BackendCreate(BaseModel):
     url: str        = Field(..., min_length=4)
     auth_token: str = Field(..., min_length=8)
+    ssh_host: Optional[str] = None              # SSH endpoint, if not the URL host
+    ssh_port: Optional[int] = Field(None, ge=1, le=65535)
 
 class WatcherCreate(BaseModel):
     username: str               = Field(..., min_length=1, max_length=64)
@@ -1548,6 +1597,7 @@ async def add_backend(body: BackendCreate):
 
     pk = str(uuid.uuid4())
     bid = health.get("backend_id", "unknown")
+    ssh_host = (body.ssh_host or "").strip() or None
     async with _db_lock:
         existing = db.execute(
             "SELECT id FROM backends WHERE backend_id=? OR url=?", (bid, url)
@@ -1557,19 +1607,21 @@ async def add_backend(body: BackendCreate):
             # refresh the token + health instead of failing on the unique key.
             db.execute(
                 "UPDATE backends SET url=?, auth_token=?, region=?, "
-                "last_health_check=?, last_health_ok=1, last_health_data=? WHERE id=?",
+                "last_health_check=?, last_health_ok=1, last_health_data=?, "
+                "ssh_host=COALESCE(?,ssh_host), ssh_port=COALESCE(?,ssh_port) WHERE id=?",
                 (url, body.auth_token, health.get("region", ""), time.time(),
-                 json.dumps(health), existing["id"]),
+                 json.dumps(health), ssh_host, body.ssh_port, existing["id"]),
             )
             db.commit()
             return {"id": existing["id"], "backend_id": bid,
                     "region": health.get("region"), "updated": True}
         db.execute(
             "INSERT INTO backends (id,backend_id,url,auth_token,region,added_at,"
-            "last_health_check,last_health_ok,last_health_data) "
-            "VALUES (?,?,?,?,?,?,?,1,?)",
+            "last_health_check,last_health_ok,last_health_data,ssh_host,ssh_port) "
+            "VALUES (?,?,?,?,?,?,?,1,?,?,?)",
             (pk, bid, url, body.auth_token,
-             health.get("region", ""), time.time(), time.time(), json.dumps(health)),
+             health.get("region", ""), time.time(), time.time(), json.dumps(health),
+             ssh_host, body.ssh_port),
         )
         db.commit()
     return {"id": pk, "backend_id": bid, "region": health.get("region")}
@@ -2373,13 +2425,19 @@ async def list_storage():
 
 
 @app.post("/api/storage", dependencies=[Depends(require_login)])
-async def add_storage(url: str, token: str):
+async def add_storage(url: str, token: str,
+                      ssh_host: Optional[str] = None, ssh_port: Optional[int] = None):
     """Add (or update) a storage server. Probes it immediately to validate."""
     url = url.rstrip("/")
     # Probe with the supplied token before saving
     code, body = await _tw_call({"url": url, "token": token}, "GET", "/status")
     async with _db_lock:
         sid = _storage_upsert(url, token)
+        sh = (ssh_host or "").strip() or None
+        if sh or ssh_port:
+            db.execute(
+                "UPDATE storage_servers SET ssh_host=COALESCE(?,ssh_host), "
+                "ssh_port=COALESCE(?,ssh_port) WHERE id=?", (sh, ssh_port, sid))
         if code == 200 and isinstance(body, dict):
             db.execute(
                 "UPDATE storage_servers SET last_health_ok=1, last_disk_free=?, "
@@ -2412,9 +2470,9 @@ async def update_storage_token(sid: str, body: dict):
 
 
 @app.get("/api/ssh-creds/{host}", dependencies=[Depends(require_login)])
-async def get_ssh_creds(host: str):
-    """Non-secret SSH cred summary for prefilling deploy/update forms."""
-    return _ssh_creds_summary(host)
+async def get_ssh_creds(host: str, port: Optional[int] = None):
+    """Non-secret SSH cred summary for prefilling/collapsing deploy/update forms."""
+    return _ssh_creds_summary(host, port)
 
 
 @app.get("/api/version-status", dependencies=[Depends(require_login)])
@@ -2445,36 +2503,41 @@ async def update_status():
     expected = BUILD
     hosts: dict[str, dict] = {}
 
-    def _entry(h):
-        return hosts.setdefault(h, {
-            "host": h, "roles": [], "names": {}, "builds": {}, "reachable": {},
-            "recorder_id": None, "storage_id": None,
+    def _entry(mkey, host, port):
+        return hosts.setdefault(mkey, {
+            "host": host, "ssh_port": port, "roles": [], "names": {}, "builds": {},
+            "reachable": {}, "recorder_id": None, "storage_id": None,
         })
 
     async with _db_lock:
         recs = db.execute(
-            "SELECT id, backend_id, url, last_build, last_health_ok FROM backends"
+            "SELECT id, backend_id, url, last_build, last_health_ok, ssh_host, ssh_port "
+            "FROM backends"
         ).fetchall()
         stos = db.execute(
-            "SELECT id, label, url, last_build, last_health_ok, last_reachable "
-            "FROM storage_servers"
+            "SELECT id, label, url, last_build, last_health_ok, last_reachable, "
+            "ssh_host, ssh_port FROM storage_servers"
         ).fetchall()
 
+    # Group by SSH endpoint (host:port), so two machines behind one public IP on
+    # different forwarded SSH ports are distinct rows, while a genuinely colocated
+    # box (one SSH endpoint serving both roles) stays a single row.
     for b in recs:
-        h = _host_of(b["url"]) or b["url"]
-        e = _entry(h)
+        sh, sp = _ssh_target(b)
+        e = _entry(_mkey(sh, sp), sh, sp)
         e["roles"].append("recorder"); e["recorder_id"] = b["id"]
         e["names"]["recorder"] = b["backend_id"]; e["builds"]["recorder"] = b["last_build"]
         e["reachable"]["recorder"] = bool(b["last_health_ok"])
     for s in stos:
-        h = _host_of(s["url"]) or s["url"]
-        e = _entry(h)
+        sh, sp = _ssh_target(s)
+        e = _entry(_mkey(sh, sp), sh, sp)
         e["roles"].append("storage"); e["storage_id"] = s["id"]
         e["names"]["storage"] = s["label"]; e["builds"]["storage"] = s["last_build"]
         e["reachable"]["storage"] = bool(s["last_health_ok"]) or bool(s["last_reachable"])
 
     out = []
-    for h, e in hosts.items():
+    for mkey, e in hosts.items():
+        h = e["host"]
         roles = sorted(set(e["roles"]))
         colocated = "recorder" in roles and "storage" in roles
         if colocated:
@@ -2491,10 +2554,10 @@ async def update_status():
         up_to_date = bool(relevant) and all(v == expected for v in relevant)
         known = [v for v in e["builds"].values() if v]
         reachable = any(e["reachable"].values())
-        creds = _get_ssh_creds(h)
+        creds = _get_creds_mkey(h, e["ssh_port"])
         has_creds = bool(creds and (creds.get("password_enc") or creds.get("key_path")))
         out.append({
-            "host": h,
+            "host": h, "ssh_port": e["ssh_port"],
             "name": e["names"].get("recorder") or e["names"].get("storage"),
             "roles": roles, "colocated": colocated,
             "kind": kind, "target_id": tid,
@@ -2511,17 +2574,17 @@ async def update_status():
             "count_outdated": n_out, "count_ready": n_ready}
 
 
-def _saved_creds_push_request(host: str, update_type: str,
+def _saved_creds_push_request(host: str, port, update_type: str,
                               target_id: str) -> Optional["PushUpdateRequest"]:
-    """Build a PushUpdateRequest from a host's saved SSH credentials, or return
+    """Build a PushUpdateRequest from a machine's saved SSH credentials, or return
     None if no usable credentials are stored. Single source of truth for the
     one-click update paths (update_node / update_all)."""
-    creds = _get_ssh_creds(host) if host else None
+    creds = _get_creds_mkey(host, port) if host else None
     if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
         return None
     return PushUpdateRequest(
         update_type=update_type, target_id=target_id,
-        ssh_port=creds.get("ssh_port") or 22,
+        ssh_port=port or creds.get("ssh_port") or 22,
         ssh_user=creds.get("ssh_user") or "root",
         auth_method=creds.get("auth_method") or "key",
         ssh_password=_decrypt_pw(creds.get("password_enc")),
@@ -2534,23 +2597,23 @@ async def update_node(req: UpdateNodeRequest):
     re-entry. Streams progress."""
     async with _db_lock:
         if req.kind in ("recorder", "colocated"):
-            row = db.execute("SELECT url FROM backends WHERE id=?",
+            row = db.execute("SELECT url, ssh_host, ssh_port FROM backends WHERE id=?",
                              (req.target_id,)).fetchone()
         else:
-            row = db.execute("SELECT url FROM storage_servers WHERE id=?",
+            row = db.execute("SELECT url, ssh_host, ssh_port FROM storage_servers WHERE id=?",
                              (req.target_id,)).fetchone()
     if not row:
         raise HTTPException(404, "target not found")
-    host = _host_of(row["url"])
+    host, port = _ssh_target(row)
 
     def work(emit):
-        pr = _saved_creds_push_request(host, req.kind, req.target_id)
+        pr = _saved_creds_push_request(host, port, req.kind, req.target_id)
         if pr is None:
-            emit(f"No saved SSH credentials for {host}.\n"
+            emit(f"No saved SSH credentials for {host}:{port}.\n"
                  "Run one Push update for this host in the Deploy tab — your "
                  "details are saved after that, and updates here become one click.\n")
             return
-        emit(f"Updating {host} ({req.kind}) with saved credentials…\n")
+        emit(f"Updating {host}:{port} ({req.kind}) with saved credentials…\n")
         _ssh_push_update(pr, host, emit)
 
     return _threaded_stream(work)
@@ -2559,23 +2622,25 @@ async def update_node(req: UpdateNodeRequest):
 @app.post("/api/update-all", dependencies=[Depends(require_login)])
 async def update_all():
     """Push the latest code to every registered node (recorder + storage) using
-    the SSH credentials saved for each host. Nodes without saved creds are
+    the SSH credentials saved for each machine. Nodes without saved creds are
     skipped with a note. Streams output, node by node."""
-    targets = []  # (update_type, target_id, host, name)
+    targets = []  # (update_type, target_id, host, port, name)
     async with _db_lock:
-        for b in db.execute("SELECT id, url, backend_id FROM backends").fetchall():
-            targets.append(("recorder", b["id"], _host_of(b["url"]), b["backend_id"]))
-        for s in db.execute("SELECT id, url, label FROM storage_servers").fetchall():
-            targets.append(("storage", s["id"], _host_of(s["url"]), s["label"]))
+        for b in db.execute("SELECT id, url, backend_id, ssh_host, ssh_port FROM backends").fetchall():
+            sh, sp = _ssh_target(b)
+            targets.append(("recorder", b["id"], sh, sp, b["backend_id"]))
+        for s in db.execute("SELECT id, url, label, ssh_host, ssh_port FROM storage_servers").fetchall():
+            sh, sp = _ssh_target(s)
+            targets.append(("storage", s["id"], sh, sp, s["label"]))
 
     def work(emit):
         done = 0
-        for kind, tid, host, name in targets:
-            pr = _saved_creds_push_request(host, kind, tid)
+        for kind, tid, host, port, name in targets:
+            pr = _saved_creds_push_request(host, port, kind, tid)
             if pr is None:
-                emit(f"\n===== {name} ({host}) — SKIPPED: no saved SSH credentials =====\n")
+                emit(f"\n===== {name} ({host}:{port}) — SKIPPED: no saved SSH credentials =====\n")
                 continue
-            emit(f"\n===== Updating {name} ({kind} @ {host}) =====\n")
+            emit(f"\n===== Updating {name} ({kind} @ {host}:{port}) =====\n")
             try:
                 _ssh_push_update(pr, host, emit)
                 done += 1
