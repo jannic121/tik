@@ -118,6 +118,10 @@ class Settings:
     upload_min_age: int     = int(os.environ.get("UPLOAD_MIN_AGE_SEC", "300"))
     upload_delete: bool     = os.environ.get("UPLOAD_DELETE_AFTER", "1") == "1"
     upload_max_retries: int = int(os.environ.get("UPLOAD_MAX_RETRIES", "3"))
+    # How many transfers to run in parallel, and how many to drain per cycle. The
+    # worker now empties the backlog each cycle instead of shipping one file per
+    # interval (which capped throughput at ~one file / UPLOAD_INTERVAL_SEC).
+    upload_concurrency: int = max(1, int(os.environ.get("UPLOAD_CONCURRENCY", "2")))
     # Shared secret recorders must present on POST /events. Empty => webhook
     # stays open (preserves prior behaviour). To enable: set the SAME value as
     # CONTROL_PLANE_TOKEN on every recorder FIRST, then here, so no event is
@@ -995,16 +999,31 @@ async def _upload_cycle_inner() -> None:
         else:
             log.warning("retention: delete of %s failed (code %d)", d["filename"], code)
 
-    # 4. Transfer one pending file per cycle (keeps bandwidth predictable)
-    async with _db_lock:
-        row = db.execute(
-            "SELECT t.*, b.url AS b_url, b.auth_token AS b_token "
-            "FROM transfers t JOIN backends b ON b.id=t.backend_pk "
-            "WHERE t.status='pending' "
-            "ORDER BY t.size_bytes ASC LIMIT 1"
-        ).fetchone()
-    if row:
-        await _do_transfer(dict(row))
+    # 4. Drain the pending queue: ship up to `upload_concurrency` files in parallel,
+    #    repeatedly, until the backlog is empty (or nothing can make progress).
+    #    Previously this shipped a single file per cycle, capping throughput at
+    #    ~one file / UPLOAD_INTERVAL_SEC regardless of how many were waiting.
+    conc = max(1, settings.upload_concurrency)
+    shipped = 0
+    while True:
+        async with _db_lock:
+            rows = db.execute(
+                "SELECT t.*, b.url AS b_url, b.auth_token AS b_token "
+                "FROM transfers t JOIN backends b ON b.id=t.backend_pk "
+                "WHERE t.status='pending' ORDER BY t.size_bytes ASC LIMIT ?",
+                (conc,),
+            ).fetchall()
+        if not rows:
+            break
+        results = await asyncio.gather(
+            *(_do_transfer(dict(r)) for r in rows), return_exceptions=True)
+        # Stop if nothing made progress (e.g. no healthy storage target) so we
+        # don't spin on the same rows; the next cycle will retry.
+        if not any(r is True for r in results):
+            break
+        shipped += sum(1 for r in results if r is True)
+    if shipped:
+        log.info("upload cycle: shipped %d file(s) to storage", shipped)
 
 
 async def _relay_file(src_url: str, src_headers: dict, src_params: dict,
@@ -1069,7 +1088,10 @@ async def _relay_file(src_url: str, src_headers: dict, src_params: dict,
             pass
 
 
-async def _do_transfer(row: dict) -> None:
+async def _do_transfer(row: dict) -> bool:
+    """Ship one recording backend→storage. Returns True if it attempted the
+    transfer (success or failure), False if it was blocked (no storage target, so
+    the row stays pending) — the drain loop uses this to avoid spinning."""
     tid = row["id"]
     # Resolve the pipeline policy for this backend
     rule = _resolve_routing(row["backend_pk"])
@@ -1080,12 +1102,12 @@ async def _do_transfer(row: dict) -> None:
             # by leaving the file pending and retrying, rather than rerouting.
             log.warning("assigned storage for %s unavailable — leaving pending",
                         row["filename"])
-            return
+            return False
     else:
         target = _pick_storage()           # auto: most free disk
     if not target:
         log.warning("no healthy storage server for %s — leaving pending", row["filename"])
-        return
+        return False
     async with _db_lock:
         db.execute(
             "UPDATE transfers SET status='transferring', storage_pk=?, storage_label=?, "
@@ -1161,6 +1183,7 @@ async def _do_transfer(row: dict) -> None:
                 (str(e)[:500], tid),
             )
             db.commit()
+    return True
 
 
 async def _upload_worker() -> None:
