@@ -847,12 +847,20 @@ async def _upload_cycle_inner() -> None:
     # 1. What's already on ANY storage server? (merge inventories)
     # dict: filename → storage server row that has it (first server wins)
     storage_fnames: dict[str, dict] = {}
+    inventory_reliable = True            # False if any healthy storage's listing failed
     for s in storages:
         code, inv = await _tw_call(s, "GET", "/files/inventory")
         if code == 200 and isinstance(inv, list):
             for fi in inv:
                 if fi["filename"] not in storage_fnames:
                     storage_fnames[fi["filename"]] = s
+        else:
+            # An incomplete view: a file genuinely on this storage will be missing
+            # from storage_fnames. Re-shipping 'done' files based on that would
+            # re-upload everything whenever the storage box is briefly busy.
+            inventory_reliable = False
+            log.warning("storage %s inventory unavailable (code %s) — not re-shipping "
+                        "'done' files this cycle", s.get("label"), code)
 
     # 2. What do backends have?
     # All registered storage ids (healthy or not). A 'done' transfer whose storage
@@ -928,7 +936,8 @@ async def _upload_cycle_inner() -> None:
                         # box was colocated storage and isn't anymore. Re-ship it so
                         # the recorder disk can actually drain.
                         stranded = (
-                            existing["recorder_deleted"] == 0
+                            inventory_reliable
+                            and existing["recorder_deleted"] == 0
                             and fname not in storage_fnames
                             and (existing["storage_pk"] is None
                                  or existing["storage_pk"] not in registered_storage_ids)
