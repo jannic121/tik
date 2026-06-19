@@ -3,8 +3,9 @@
 # Provision a storage server with the Whisper transcription worker.
 #
 # Usage (called by the control plane Deploy tab — no manual arguments needed):
-#   sudo bash provision_storage.sh [BIND_ADDRESS]
-#   BIND_ADDRESS defaults to 0.0.0.0 (passed automatically by the control plane)
+#   sudo bash provision_storage.sh [BIND_ADDRESS] [PORT]
+#   BIND_ADDRESS defaults to 0.0.0.0, PORT defaults to 8090 (both passed
+#   automatically by the control plane Deploy tab)
 #
 # Whisper model defaults to "base" (~150MB, ~4 min/hr stream).
 # To change it after deploy: edit /etc/tt-storage.env and restart tt-transcription.
@@ -15,6 +16,7 @@ set -euo pipefail
 trap 'echo "[ERROR] provision_storage.sh failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 BIND_ADDRESS="${1:-0.0.0.0}"
+PORT="${2:-8090}"
 WHISPER_MODEL="base"
 
 INSTALL_DIR=/opt/tt-storage
@@ -113,7 +115,7 @@ if [[ ! -f $ENV_FILE ]]; then
 WHISPER_WATCH_DIR=$RECORDINGS_DIR
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_HOST=$BIND_ADDRESS
-WHISPER_PORT=8090
+WHISPER_PORT=$PORT
 WHISPER_AUTH_TOKEN=$WHISPER_AUTH_TOKEN
 STORAGE_UI_PASSWORD=$STORAGE_UI_PASSWORD
 WHISPER_SCAN_INTERVAL=30
@@ -222,11 +224,11 @@ systemctl restart tt-transcription
 
 echo "==> Checking firewall"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  if ufw status | grep -qE "^8090.*ALLOW"; then
-    echo "    UFW: port 8090 is open"
+  if ufw status | grep -qE "^$PORT.*ALLOW"; then
+    echo "    UFW: port $PORT is open"
   else
-    echo "    [WARN] UFW active but port 8090 not open"
-    echo "    Run: sudo ufw allow 8090/tcp && sudo ufw reload"
+    echo "    [WARN] UFW active but port $PORT not open"
+    echo "    Run: sudo ufw allow $PORT/tcp && sudo ufw reload"
   fi
 else
   echo "    UFW not active (check cloud security group if needed)"
@@ -234,7 +236,7 @@ fi
 
 echo "==> Self-test: waiting for service to come up"
 sleep 4
-if curl -s --max-time 5 http://localhost:8090/health 2>/dev/null | grep -q '"ok":true'; then
+if curl -s --max-time 5 http://localhost:$PORT/health 2>/dev/null | grep -q '"ok":true'; then
   echo "    Service is responding to /health"
 else
   echo "    [WARN] Service not responding yet"

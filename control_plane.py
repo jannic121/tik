@@ -612,6 +612,8 @@ class DeployRequest(BaseModel):
     backend_id: str             = ""
     region: str                 = ""
     bind_address: str           = "0.0.0.0"
+    # Port the service binds on the box (0 = default: recorder 8000 / storage 8090)
+    service_port: int           = Field(0, ge=0, le=65535)
     # Storage-only
     whisper_model: str          = "base"
 
@@ -781,14 +783,16 @@ def _ssh_deploy(req: DeployRequest, emit) -> None:
     try:
         # Select file set, command, and args based on deploy type
         bind = "127.0.0.1" if req.host in ("127.0.0.1", "localhost") else "0.0.0.0"
+        svc_port = req.service_port or (8090 if req.deploy_type == "storage" else 8000)
         if req.deploy_type == "storage":
             deploy_files = STORAGE_DEPLOY_FILES
             script_name  = "provision_storage.sh"
-            script_args  = bind          # model is hardcoded to base in the script
+            script_args  = f"{bind} {svc_port}"   # model is hardcoded to base in the script
         else:
             deploy_files = RECORDER_DEPLOY_FILES
             script_name  = "provision.sh"
-            script_args  = bind          # backend_id/region auto-detected on VPS
+            script_args  = f"{bind} {svc_port}"   # backend_id/region auto-detected on VPS
+        emit(f"==> Service will listen on {bind}:{svc_port}\n")
 
         missing = [f for f in deploy_files
                    if not (settings.files_dir / f).exists()]

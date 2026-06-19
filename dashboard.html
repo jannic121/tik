@@ -623,6 +623,19 @@
         Storage server is auto-configured with the base Whisper model (~150MB,
         downloads on first transcription). Change model in /etc/tt-storage.env if needed.
       </p>
+      <details id="d-ports-section" style="margin-top:14px;border:1px solid #2a2a2a;border-radius:6px;padding:6px 12px;">
+        <summary style="cursor:pointer;font-size:13px;color:#9aa;">Ports
+          <span class="dim">— defaults are fine unless behind NAT or sharing an IP</span></summary>
+        <label style="margin-top:8px;">Service listen port (on the box)
+          <input id="d-listen-port" type="number" placeholder="8000 recorder / 8090 storage" />
+        </label>
+        <div class="row2" style="margin-top:8px;">
+          <label>Control plane connects to — host<input id="d-pub-host" placeholder="defaults to the SSH host" /></label>
+          <label>port<input id="d-pub-port" type="number" placeholder="defaults to the listen port" /></label>
+        </div>
+        <span class="dim" style="font-size:11px;">Behind NAT, set these to the public IP and the forwarded port.
+          The box binds the listen port; the control plane registers and connects to the host:port above.</span>
+      </details>
       <!-- Push update section -->
       <div id="d-push-section" style="display:none">
         <h3 style="margin-top:18px;">Push update</h3>
@@ -2622,6 +2635,7 @@ function setDeployType(type) {
   $('d-note-recorder') && ($('d-note-recorder').style.display = isRec ? '' : 'none');
   $('d-note-storage')  && ($('d-note-storage').style.display  = isSto ? '' : 'none');
   $('d-push-section').style.display = isPush ? '' : 'none';
+  $('d-ports-section') && ($('d-ports-section').style.display = isPush ? 'none' : '');
   ['recorder','storage','push'].forEach(t => {
     const el = $('dtype-'+t); if (!el) return;
     el.style.background = type===t ? '#2d2d2d' : '';
@@ -2730,6 +2744,7 @@ async function runDeploy() {
     btn.disabled = false; btn.textContent = 'Deploy'; return;
   }
 
+  const listenPort = parseInt($('d-listen-port').value, 10) || 0;
   const body = {
     deploy_type:  _currentDeployType,
     host,
@@ -2738,6 +2753,7 @@ async function runDeploy() {
     auth_method:  $('d-auth').value,
     ssh_password: $('d-pw').value,
     ssh_key_path: $('d-key').value.trim(),
+    service_port: listenPort,
     // unused fields kept for API compatibility
     backend_id: '', region: '', bind_address: '0.0.0.0', whisper_model: 'base',
   };
@@ -2757,20 +2773,24 @@ async function runDeploy() {
       buf += chunk; out.textContent += chunk; out.scrollTop = out.scrollHeight;
     }
 
+    const pubHost = ($('d-pub-host').value||'').trim() || host;
+    const pubPort = parseInt($('d-pub-port').value,10) || listenPort
+                    || (_currentDeployType==='storage' ? 8090 : 8000);
+    const regUrl = `http://${pubHost}:${pubPort}`;
+    const sshPort = parseInt($('d-port').value,10);
     if (_currentDeployType === 'storage') {
       const m = buf.match(/WHISPER_AUTH_TOKEN:\s*([0-9a-f]{64})/);
       if (m) {
-        const url = `http://${host}:8090`;
-        showResult('Storage server deployed', 'Registering transcript worker...');
-        await autoRegisterStorage(url, m[1], host, parseInt($('d-port').value,10));
+        showResult('Storage server deployed', `Registering ${regUrl} ...`);
+        await autoRegisterStorage(regUrl, m[1], host, sshPort);
       }
     } else {
       const m = buf.match(/AUTH_TOKEN:\s*([0-9a-f]{64})/);
       const bid = buf.match(/Backend ID:\s*(\S+)/);
       if (m) {
         const label = bid ? bid[1] : host;
-        showResult(`Recorder backend deployed (${label})`, 'Registering backend...');
-        await autoRegisterBackend(host, m[1], host, parseInt($('d-port').value,10));
+        showResult(`Recorder backend deployed (${label})`, `Registering ${regUrl} ...`);
+        await autoRegisterBackend(regUrl, m[1], host, sshPort);
       }
     }
   } catch(e) {
@@ -2788,8 +2808,7 @@ function showResult(title, statusText) {
   $('d-result').scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
-async function autoRegisterBackend(host, token, sshHost, sshPort) {
-  const url = `http://${host}:8000`;
+async function autoRegisterBackend(url, token, sshHost, sshPort) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     $('d-result-status').textContent = `Registering backend... (attempt ${attempt}/5)`;
     const r = await api('/api/backends', {

@@ -3,8 +3,9 @@
 # Provision a fresh recorder backend on Ubuntu 24.04 LTS.
 # Called by the control plane Deploy tab — no manual arguments needed.
 #
-# Usage:  sudo bash provision.sh [BIND_ADDRESS]
-#   BIND_ADDRESS defaults to 0.0.0.0 (passed automatically by the control plane)
+# Usage:  sudo bash provision.sh [BIND_ADDRESS] [PORT]
+#   BIND_ADDRESS defaults to 0.0.0.0, PORT defaults to 8000 (both passed
+#   automatically by the control plane Deploy tab)
 #
 # Everything else is auto-detected on the VPS:
 #   BACKEND_ID  — hostname + random hex suffix
@@ -16,6 +17,7 @@ set -euo pipefail
 trap 'echo "[ERROR] provision.sh failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 BIND_ADDRESS="${1:-0.0.0.0}"
+PORT="${2:-8000}"
 
 echo "==> Detecting backend identity"
 BACKEND_ID="$(hostname -s 2>/dev/null | sed 's/[^a-zA-Z0-9-]/-/g' | cut -c1-20)-$(openssl rand -hex 4)"
@@ -23,7 +25,7 @@ REGION="$(curl -s --max-time 5 https://ipinfo.io/country 2>/dev/null | tr -d '"'
 [[ -z "$REGION" || "${#REGION}" -gt 3 ]] && REGION="auto"
 echo "    Backend ID: $BACKEND_ID"
 echo "    Region:     $REGION"
-echo "    Bind:       $BIND_ADDRESS" 
+echo "    Bind:       $BIND_ADDRESS:$PORT"
 
 # Pin the Michele0303 version. Bump deliberately when upstream ships fixes.
 # Tags use plain numbers with no "v" prefix e.g. 8.0.0, not v8.0.0
@@ -178,7 +180,7 @@ Group=tt
 WorkingDirectory=/opt/tt-backend
 EnvironmentFile=/etc/tt-backend.env
 ExecStart=/opt/tt-backend/.venv/bin/uvicorn app:app \\
-          --host $BIND_ADDRESS --port 8000 \\
+          --host $BIND_ADDRESS --port $PORT \\
           --timeout-graceful-shutdown 60
 Restart=on-failure
 RestartSec=5
@@ -211,11 +213,11 @@ systemctl restart tt-backend
 echo
 echo "==> Checking firewall"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  if ufw status | grep -qE "^8000.*ALLOW"; then
-    echo "    UFW: port 8000 is open. Good."
+  if ufw status | grep -qE "^$PORT.*ALLOW"; then
+    echo "    UFW: port $PORT is open. Good."
   else
-    echo "    [WARN] UFW is active but port 8000 is not open."
-    echo "    Run: sudo ufw allow 8000/tcp"
+    echo "    [WARN] UFW is active but port $PORT is not open."
+    echo "    Run: sudo ufw allow $PORT/tcp"
     echo "    Then: sudo ufw reload"
   fi
 else
@@ -225,7 +227,7 @@ fi
 echo
 echo "==> Self-test: waiting for service to come up"
 sleep 4
-if curl -s --max-time 5 http://localhost:8000/health 2>/dev/null | grep -q "backend_id"; then
+if curl -s --max-time 5 http://localhost:$PORT/health 2>/dev/null | grep -q "backend_id"; then
   echo "    Service is up and responding to /health"
 else
   echo "    [WARN] Service not responding yet."
@@ -237,12 +239,12 @@ echo
 echo "==> Done. Service status:"
 systemctl status tt-backend --no-pager | head -6
 echo
-echo "Probe:  curl -s http://127.0.0.1:8000/health | jq"
+echo "Probe:  curl -s http://127.0.0.1:$PORT/health | jq"
 echo
 echo "Next steps:"
-echo "  1. (if internet-facing) ensure your firewall/security-group allows TCP 8000"
+echo "  1. (if internet-facing) ensure your firewall/security-group allows TCP $PORT"
 echo "  2. From your control plane, register this backend:"
-echo "       url:   http://<this-server-ip-or-hostname>:8000"
-echo "                (or http://localhost:8000 if colocated)"
+echo "       url:   http://<this-server-ip-or-hostname>:$PORT"
+echo "                (or http://localhost:$PORT if colocated)"
 echo "       token: the AUTH_TOKEN above"
 echo "  3. Edit $ENV_FILE to fill in CONTROL_PLANE_URL, then  systemctl restart tt-backend"
