@@ -474,10 +474,20 @@
       </label>
     </div>
     <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;">
-      <input type="checkbox" id="ar-delete" style="width:auto;" onchange="$('ar-delaywrap').style.display=this.checked?'':'none'"/>
-      Delete the local copy after it's archived (frees storage; transcript kept for search)
+      <input type="checkbox" id="ar-delete" style="width:auto;" onchange="$('ar-evict').style.display=this.checked?'':'none'"/>
+      Reclaim disk: evict verified-on-cloud copies when the disk fills (oldest first; transcript kept)
     </label>
-    <span id="ar-delaywrap" style="display:none;font-size:13px;">after <input id="ar-delay" type="number" min="0" step="0.5" value="24" style="width:64px;"/> hours</span>
+    <div id="ar-evict" style="display:none;font-size:13px;margin:6px 0 0 26px;color:#aaa;">
+      <div class="row2">
+        <label>Evict above (disk %)<input id="ar-evict-high" type="number" min="1" max="100" value="85" style="width:80px;"/></label>
+        <label>down to (disk %)<input id="ar-evict-low" type="number" min="0" max="100" value="70" style="width:80px;"/></label>
+      </div>
+      <label>Keep files hot for at least <input id="ar-evict-age" type="number" min="0" step="0.5" value="24" style="width:64px;"/> hours</label>
+    </div>
+    <div class="row2" style="margin-top:8px;font-size:13px;">
+      <label>Parallel transfers<input id="ar-transfers" type="number" min="1" max="32" value="4" style="width:80px;"/></label>
+      <label>Bandwidth cap (optional)<input id="ar-bwlimit" placeholder="e.g. 10M — blank = unlimited"/></label>
+    </div>
 
     <h3 style="margin:16px 0 6px;font-size:13px;">SSH to the storage server</h3>
     <div class="row2">
@@ -2203,8 +2213,12 @@ async function enableArchive() {
   const p = $('ar-provider').value;
   const body = { ...(_archiveSsh()), provider:p, remote_name:'archive',
     remote_path: $('ar-path').value.trim(), archive_what: $('ar-what').value,
-    delete_local: $('ar-delete').checked,
-    delete_delay_sec: $('ar-delete').checked ? Math.round(parseFloat($('ar-delay').value||'0')*3600) : 0 };
+    delete_local: $('ar-delete').checked, delete_delay_sec: 0,
+    evict_high_pct: parseFloat($('ar-evict-high').value||'85'),
+    evict_low_pct: parseFloat($('ar-evict-low').value||'70'),
+    evict_min_age_sec: Math.round(parseFloat($('ar-evict-age').value||'24')*3600),
+    transfers: parseInt($('ar-transfers').value||'4',10),
+    bwlimit: $('ar-bwlimit').value.trim(), retry_backoff_sec: 120 };
   if (p==='s3'){ body.s3_access_key=$('ar-s3-key').value.trim(); body.s3_secret=$('ar-s3-secret').value;
     body.s3_region=$('ar-s3-region').value.trim(); body.s3_endpoint=$('ar-s3-endpoint').value.trim(); }
   else if (p==='b2'){ body.b2_account=$('ar-b2-account').value.trim(); body.b2_key=$('ar-b2-key').value; }

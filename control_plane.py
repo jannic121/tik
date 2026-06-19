@@ -2606,6 +2606,13 @@ class ArchiveConfigRequest(BaseModel):
     archive_what: str = Field("mp4", pattern="^(mp4|txt|both)$")
     delete_local: bool = False
     delete_delay_sec: int = Field(0, ge=0)
+    # disk-aware eviction + rclone tuning
+    evict_high_pct: float = Field(85, ge=1, le=100)
+    evict_low_pct: float = Field(70, ge=0, le=100)
+    evict_min_age_sec: int = Field(86400, ge=0)
+    transfers: int = Field(4, ge=1, le=32)
+    bwlimit: str = ""
+    retry_backoff_sec: int = Field(120, ge=1)
 
 
 def _build_rclone_conf(req: ArchiveConfigRequest) -> str:
@@ -2652,6 +2659,12 @@ def _ssh_archive_config(req: ArchiveConfigRequest, host: str, emit) -> None:
         f"ARCHIVE_WHAT={req.archive_what}",
         f"ARCHIVE_DELETE_LOCAL={'1' if req.delete_local else '0'}",
         f"ARCHIVE_DELETE_DELAY_SEC={req.delete_delay_sec}",
+        f"ARCHIVE_EVICT_HIGH_PCT={req.evict_high_pct}",
+        f"ARCHIVE_EVICT_LOW_PCT={req.evict_low_pct}",
+        f"ARCHIVE_EVICT_MIN_AGE_SEC={req.evict_min_age_sec}",
+        f"ARCHIVE_TRANSFERS={req.transfers}",
+        f"ARCHIVE_BWLIMIT={req.bwlimit}",
+        f"ARCHIVE_RETRY_BACKOFF={req.retry_backoff_sec}",
     ]
     upsert = "\n".join(
         f'{sudo}sed -i "/^{kv.split("=")[0]}=/d" {STORAGE_ENV_FILE}; '
