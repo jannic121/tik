@@ -127,6 +127,7 @@
     <button data-tab="search"   onclick="switchTab('search')">Search</button>
     <button data-tab="chat"      onclick="switchTab('chat')">Chat</button>
     <button data-tab="routing"  onclick="switchTab('routing')">Routing</button>
+    <button data-tab="archive"  onclick="switchTab('archive')">Archive</button>
     <button data-tab="deploy"   onclick="switchTab('deploy')">Deploy</button>
   </nav>
   <button class="logout" onclick="logout()">Sign out</button>
@@ -427,13 +428,23 @@
   </p>
   <div id="routing-content"></div>
 
-  <h2 style="margin-top:28px;border-top:1px solid #2a2a2a;padding-top:20px;">Cloud archive (3rd hop)</h2>
-  <p style="font-size:12px;color:#888;margin:0 0 12px;max-width:680px;">
-    After a recording is transcribed, push it to any cloud (S3, Cloudflare R2, Wasabi,
-    Backblaze B2, Dropbox, …) via rclone — configured entirely from here. The control
-    plane SSHes to the storage server, writes an rclone config, and restarts the service.
-    Deleting the local copy (to free space) only happens after the upload is verified on the remote.
+</section>
+
+<section class="panel" id="panel-archive">
+  <div class="panel-head">
+    <h2>Cloud archive</h2>
+    <div class="actions"><button class="ghost" onclick="loadArchive()">Refresh</button></div>
+  </div>
+  <p style="font-size:12px;color:#888;margin:0 0 14px;max-width:720px;">
+    The optional 3rd hop: after a recording is transcribed, push it to any cloud
+    (S3, Cloudflare R2, Wasabi, Backblaze B2, Dropbox, or end-to-end-encrypted Filen)
+    via rclone. The control plane SSHes to the storage server, writes the rclone config,
+    and restarts the service. A local copy is only ever deleted after the upload is
+    verified present on the remote.
   </p>
+  <div id="archive-overview"></div>
+
+  <h3 style="margin:22px 0 10px;border-top:1px solid #2a2a2a;padding-top:18px;font-size:14px;">Configure a server</h3>
   <div id="archive-config">
     <label>Storage server to configure
       <select id="ar-server" onchange="onArchiveServerSelect()"><option value="">Loading…</option></select>
@@ -776,7 +787,8 @@ function switchTab(name) {
     p=>p.classList.toggle('active', p.id==='panel-'+name));
   ({servers:loadServers, watchers:loadWatchers, files:loadFiles,
     transcription:loadTranscription, updates:loadUpdates, catalog:loadCatalog,
-    search:loadSearchIndex, chat:loadChat, routing:loadRouting, deploy:()=>{}})[name]?.();
+    search:loadSearchIndex, chat:loadChat, routing:loadRouting,
+    archive:loadArchive, deploy:()=>{}})[name]?.();
 }
 
 // Servers tab = recorders + storage/transcription together.
@@ -2193,14 +2205,19 @@ function _storageOptions(sel) {
   return auto + opts;
 }
 
-function _ruleRow(label, key, rule) {
+function _host(u){ try { return new URL(u).hostname; } catch(_){ return u; } }
+
+function _ruleRow(label, key, rule, badge) {
   const p = 'r_' + key.replace(/[^a-zA-Z0-9]/g,'_');
   const tgt = rule ? rule.target_storage_pk : null;
   const mode = rule ? rule.delete_mode : 'immediate';
   const delay = rule ? rule.delete_delay_sec : 0;
+  const ts = tgt && _routingData.storages.find(s=>s.id===tgt);
+  const warn = ts && !ts.healthy
+    ? ' <span title="this target storage is currently offline" style="color:#fc6;">⚠ offline</span>' : '';
   return `<tr>
-    <td><strong>${esc(label)}</strong></td>
-    <td><select id="${p}-target">${_storageOptions(tgt)}</select></td>
+    <td><strong>${esc(label)}</strong>${badge||''}</td>
+    <td><select id="${p}-target">${_storageOptions(tgt)}</select>${warn}</td>
     <td>${_delControls(p, mode, delay)}</td>
     <td style="white-space:nowrap;">
       <button class="primary" style="font-size:12px;padding:4px 10px;"
@@ -2226,15 +2243,18 @@ async function loadRouting() {
   if (_routingData.backends.length) {
     html += `<h3 style="margin:18px 0 8px;font-size:14px;">Per-backend overrides</h3>
       <table><thead><tr><th>Backend</th><th>Send to</th><th>Recorder retention</th><th></th></tr></thead><tbody>`;
+    const shosts = new Set(_routingData.storages.map(s => _host(s.url)));
     html += _routingData.backends.map(b => {
       const rule = _routingData.rules[b.id];
       const label = `${b.backend_id}${b.region?' ('+b.region+')':''}`;
-      return _ruleRow(label, b.id, rule);
+      const colo = shosts.has(_host(b.url))
+        ? ' <span title="this recorder shares a disk with a storage server — its recordings are already on storage, so retention here is moot" style="background:#13302b;color:#6ee7a7;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:6px;">colocated</span>'
+        : '';
+      return _ruleRow(label, b.id, rule, colo);
     }).join('');
     html += `</tbody></table>`;
   }
   el.innerHTML = html;
-  _archiveServerOptions();
 }
 
 async function saveRouting(key, prefix) {
@@ -2262,37 +2282,82 @@ async function clearRouting(key) {
 }
 
 // ── Cloud archive (3rd hop) ──────────────────────────────────────
+let _archiveServers = [];   // last /api/archive/overview result
+
 function onArchiveProviderChange() {
   const p = $('ar-provider').value;
   ['s3','b2','dropbox','filen','raw'].forEach(x =>
     $('ar-fields-'+x).style.display = (x===p) ? '' : 'none');
 }
 
-async function onArchiveServerSelect() {
-  const sid = $('ar-server').value;
-  const cur = $('ar-current');
-  if (!sid || !_routingData) { cur.textContent = ''; return; }
-  // pull live archive status from the breakdown
+// Load the Archive tab: existing per-server config overview + the config form.
+async function loadArchive() {
+  onArchiveProviderChange();
+  const ov = $('archive-overview');
+  let servers = [];
   try {
-    const r = await api('/api/storage-breakdown');
-    if (r && r.ok) {
-      const d = await r.json();
-      const s = d.servers.find(x => x.id === sid);
-      cur.textContent = (s && s.archive_remote)
-        ? `Currently archiving to ${s.archive_remote} (${s.archived_count||0} archived).`
-        : 'Archiving not configured on this server yet.';
-    }
+    const r = await api('/api/archive/overview');
+    if (r && r.ok) servers = (await r.json()).servers || [];
   } catch(_) {}
+  _archiveServers = servers;
+
+  // Server picker for the form
+  const sel = $('ar-server');
+  if (sel) {
+    const prev = sel.value;
+    sel.innerHTML = servers.length
+      ? servers.map(s=>`<option value="${s.id}">${esc(s.label)}</option>`).join('')
+      : '<option value="">No storage servers</option>';
+    if (prev && servers.some(s=>s.id===prev)) sel.value = prev;
+    onArchiveServerSelect();
+  }
+
+  if (ov) {
+    if (!servers.length) {
+      ov.innerHTML = '<div class="empty">No storage servers yet — add one in the Servers tab.</div>';
+    } else {
+      ov.innerHTML = `<table>
+        <thead><tr><th>Storage server</th><th>Status</th><th>Remote</th><th>Archives</th>
+          <th>Reclaim disk</th><th>Last evict</th><th></th></tr></thead>
+        <tbody>${servers.map(s=>{
+          const off = !s.healthy ? '<span class="dim"> · offline</span>' : '';
+          let status;
+          if (!s.healthy) status = '<span style="color:#888;">unreachable</span>';
+          else if (s.configured) status = '<span style="color:#6ee7a7;">✓ archiving</span>';
+          else status = '<span style="color:#888;">not configured</span>';
+          const fail = s.archive_failed_count
+            ? ` <span style="color:#f99;" title="failed archive attempts">(${s.archive_failed_count} failed)</span>` : '';
+          const reclaim = s.configured
+            ? (s.delete_local ? `evict &gt; ${s.evict_high_pct??85}% disk` : '<span class="dim">off (keep all)</span>')
+            : '—';
+          return `<tr>
+            <td><strong>${esc(s.label)}</strong>${off}</td>
+            <td>${status}</td>
+            <td class="mono dim" style="font-size:11px;">${s.remote?esc(s.remote)+(s.what?` <span class="dim">(${esc(s.what)})</span>`:''):'—'}</td>
+            <td>${s.configured?(s.archived_count??0)+fail:'—'}</td>
+            <td style="font-size:12px;">${reclaim}</td>
+            <td class="dim" style="font-size:11px;">${s.last_evict?esc(s.last_evict):'—'}</td>
+            <td><button class="ghost" style="font-size:12px;padding:4px 10px;"
+                  onclick="pickArchiveServer('${s.id}')">${s.configured?'Edit':'Set up'}</button></td>
+          </tr>`;}).join('')}</tbody></table>`;
+    }
+  }
 }
 
-function _archiveServerOptions() {
-  const sel = $('ar-server');
-  if (!_routingData || !_routingData.storages.length) {
-    sel.innerHTML = '<option value="">No storage servers</option>'; return;
-  }
-  sel.innerHTML = _routingData.storages.map(s =>
-    `<option value="${s.id}">${esc(s.label||s.url)}</option>`).join('');
+function pickArchiveServer(sid) {
+  const sel = $('ar-server'); if (sel) sel.value = sid;
   onArchiveServerSelect();
+  $('archive-config')?.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function onArchiveServerSelect() {
+  const sid = $('ar-server') ? $('ar-server').value : '';
+  const cur = $('ar-current');
+  if (!cur) return;
+  const s = _archiveServers.find(x => x.id === sid);
+  cur.innerHTML = (s && s.configured)
+    ? `Currently archiving to <span class="mono">${esc(s.remote)}</span> (${s.archived_count||0} archived).`
+    : 'Archiving not configured on this server yet.';
 }
 
 async function _streamArchive(url, body, btn, label) {
@@ -2306,7 +2371,7 @@ async function _streamArchive(url, body, btn, label) {
     while(true){ const {value,done}=await reader.read(); if(done)break;
       out.textContent += dec.decode(value,{stream:true}); out.scrollTop=out.scrollHeight; }
   } catch(e){ out.textContent += '\n[ERROR] '+e.message; }
-  finally { if(btn){ btn.disabled=false; btn.textContent=label==='Working…'?'Configure & enable':label; } onArchiveServerSelect(); }
+  finally { if(btn){ btn.disabled=false; btn.textContent=label==='Working…'?'Configure & enable':label; } loadArchive(); }
 }
 
 function _archiveSsh() {

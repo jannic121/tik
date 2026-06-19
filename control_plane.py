@@ -2691,6 +2691,31 @@ async def delete_routing(backend_pk: str):
     return {"ok": True}
 
 
+@app.get("/api/archive/overview", dependencies=[Depends(require_login)])
+async def archive_overview():
+    """Per-storage-server cloud-archive configuration + counters, read live from
+    each server's /status. Powers the Archive tab's 'current configuration' view."""
+    out = []
+    for s in _storage_all():
+        entry = {"id": s["id"], "label": s["label"] or s["url"], "url": s["url"],
+                 "healthy": bool(s["last_health_ok"]), "configured": False,
+                 "remote": None, "what": None, "delete_local": None,
+                 "evict_high_pct": None, "archived_count": None,
+                 "archive_failed_count": None, "last_evict": None}
+        code, st = await _tw_call(s, "GET", "/status")
+        if code == 200 and isinstance(st, dict):
+            entry["remote"] = st.get("archive_remote")
+            entry["configured"] = bool(st.get("archive_remote"))
+            entry["what"] = st.get("archive_what")
+            entry["delete_local"] = st.get("archive_delete_local")
+            entry["evict_high_pct"] = st.get("archive_evict_high_pct")
+            entry["archived_count"] = st.get("archived_count")
+            entry["archive_failed_count"] = st.get("archive_failed_count")
+            entry["last_evict"] = st.get("last_evict")
+        out.append(entry)
+    return {"servers": out}
+
+
 @app.get("/api/storage-breakdown", dependencies=[Depends(require_login)])
 async def storage_breakdown():
     """Per-storage-server usage with a per-creator breakdown, by querying each
