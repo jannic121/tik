@@ -2417,7 +2417,7 @@ async function loadArchive() {
             <td class="mono dim" style="font-size:11px;">${s.remote?esc(s.remote)+(s.what?` <span class="dim">(${esc(s.what)})</span>`:''):'—'}</td>
             <td>${s.configured?(s.archived_count??0)+fail:'—'}</td>
             <td style="font-size:12px;">${reclaim}</td>
-            <td class="dim" style="font-size:11px;">${s.last_evict?esc(s.last_evict):'—'}</td>
+            <td class="dim" style="font-size:11px;" title="${esc(_evictTitle(s.last_evict))}">${_fmtEvict(s.last_evict)}</td>
             <td style="white-space:nowrap;"><button class="ghost" style="font-size:12px;padding:4px 10px;"
                   onclick="pickArchiveServer('${s.id}')">${s.configured?'Edit':'Set up'}</button>${
               s.configured ? `<button class="ghost" style="font-size:12px;padding:4px 10px;margin-left:4px;"
@@ -2425,6 +2425,27 @@ async function loadArchive() {
           </tr>`;}).join('')}</tbody></table>`;
     }
   }
+}
+
+function _fmtEvict(le) {
+  if (!le || typeof le !== 'object') return '—';
+  if (le.evicted) return `freed ${fmtBytes(le.freed_bytes)} · ${le.evicted} file${le.evicted===1?'':'s'}`;
+  switch (le.reason) {
+    case 'disabled': return 'off';
+    case 'disk_below_high': return `idle · disk ${le.disk_pct_before}% < ${le.high_pct}%`;
+    case 'no_eligible_files':
+      if (le.archived === 0) return '⚠ nothing archived yet';
+      if (le.candidates === 0 && le.skipped_young > 0) return `${le.skipped_young} archived <${le.min_age_h}h (kept hot)`;
+      if (le.skipped_remote > 0) return `⚠ ${le.skipped_remote} not verified on remote`;
+      return 'no eligible files';
+    default: return '—';
+  }
+}
+function _evictTitle(le) {
+  if (!le || typeof le !== 'object') return '';
+  return `disk ${le.disk_pct_before}% (evict >${le.high_pct}% → ${le.low_pct}%) · `
+    + `${le.archived}/${le.total_mp4} archived · ${le.candidates} eligible · `
+    + `${le.skipped_young} too new (<${le.min_age_h}h) · ${le.skipped_remote} unverified`;
 }
 
 function pickArchiveServer(sid) {

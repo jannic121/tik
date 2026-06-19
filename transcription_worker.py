@@ -629,8 +629,12 @@ class TranscriptionWorker:
             return False
 
     def _remote_has(self, mp4: Path) -> bool:
-        """Verify the mp4 is present on the remote (and the same size, when the
-        listing reports it) before deleting the local copy."""
+        """Confirm the archived copy is still on the remote before deleting the local
+        one. The `.archived` marker already means rclone made a checksum-verified copy,
+        so presence-by-name is sufficient. A reported size that doesn't match (e.g. an
+        end-to-end-encrypted backend that lists sizes differently) is logged but does
+        NOT block eviction — otherwise a backend quirk silently lets the disk fill to
+        100%. Only a genuinely-absent file (or a listing error) keeps the local copy."""
         try:
             from rclone_python import rclone
             username = mp4.parent.name
@@ -640,13 +644,14 @@ class TranscriptionWorker:
                     continue
                 size = item.get("Size")
                 try:
-                    # Present by name. If the listing reports a size it must match;
-                    # if it doesn't report one, presence is enough (the copy was
-                    # already checksum-verified by rclone at archive time).
-                    return size is None or int(size) == mp4.stat().st_size
+                    if size is not None and int(size) != mp4.stat().st_size:
+                        log.warning("evict verify: %s remote size %s != local %s "
+                                    "(present, verified at archive time — allowing)",
+                                    mp4.name, size, mp4.stat().st_size)
                 except (OSError, ValueError, TypeError):
-                    return False                 # can't confirm → never green-light deletion
-            return False
+                    pass
+                return True                  # present on the remote by name
+            return False                     # not found on remote — keep the local copy
         except Exception as e:
             log.warning("archive verify failed for %s: %s", mp4.name, e)
             return False
@@ -672,37 +677,54 @@ class TranscriptionWorker:
         usage drops to the low-water mark. Files younger than the min-age are kept
         hot. Never deletes a file not confirmed present on the remote."""
         if not settings.archive_delete_local:
+            self._last_evict = {"at": time.time(), "reason": "disabled", "evicted": 0}
             return
         try:
             du = shutil.disk_usage(settings.watch_dir)
         except Exception:
             return
         used_pct = 100 * (1 - du.free / du.total) if du.total else 0.0
-        if used_pct < settings.archive_evict_high_pct:
-            return                              # plenty of room — keep everything hot
         now = time.time()
         min_age = max(settings.archive_delete_delay_sec, settings.archive_evict_min_age_sec)
+        # Survey every recording so the diagnostic can explain why nothing was freed.
+        total_mp4 = archived = skipped_young = 0
         cands: list[tuple[float, Path]] = []
         for mp4 in settings.watch_dir.rglob("*.mp4"):
             if mp4.name.endswith("_flv.mp4"):
                 continue
+            total_mp4 += 1
             marker = self._archived_marker(mp4)
             if not marker.exists():
-                continue
+                continue                        # not on the cloud yet → not evictable
+            archived += 1
             try:
                 if (now - marker.stat().st_mtime) < min_age:
-                    continue                    # still hot
+                    skipped_young += 1          # archived too recently — kept hot
+                    continue
                 cands.append((mp4.stat().st_mtime, mp4))
             except OSError:
                 continue
+        diag = {"at": now, "evicted": 0, "freed_bytes": 0,
+                "disk_pct_before": round(used_pct, 1),
+                "high_pct": settings.archive_evict_high_pct,
+                "low_pct": settings.archive_evict_low_pct,
+                "min_age_h": round(min_age / 3600, 2),
+                "total_mp4": total_mp4, "archived": archived,
+                "skipped_young": skipped_young, "candidates": len(cands),
+                "skipped_remote": 0}
+        if used_pct < settings.archive_evict_high_pct:
+            diag["reason"] = "disk_below_high"   # plenty of room — keep everything hot
+            self._last_evict = diag
+            return
         cands.sort()                            # oldest recording first
         target_free = du.total * (1 - settings.archive_evict_low_pct / 100)
-        freed = evicted = 0
+        freed = evicted = skipped_remote = 0
         for _, mp4 in cands:
             if (du.free + freed) >= target_free:
                 break                           # back under the low-water mark
             if not self._remote_has(mp4):
-                continue                        # not confirmed on cloud — never delete
+                skipped_remote += 1             # not confirmed on cloud — never delete
+                continue
             try:
                 sz = mp4.stat().st_size
                 mp4.unlink()
@@ -715,8 +737,15 @@ class TranscriptionWorker:
         if evicted:
             log.info("evict: freed %s across %d file(s) (disk was %.0f%%)",
                      f"{freed:,}", evicted, used_pct)
-        self._last_evict = {"at": now, "evicted": evicted, "freed_bytes": freed,
-                            "disk_pct_before": round(used_pct, 1)}
+        else:
+            log.info("evict: nothing freed at %.0f%% — archived=%d candidates=%d "
+                     "skipped_young=%d skipped_remote=%d min_age=%.1fh",
+                     used_pct, archived, len(cands), skipped_young, skipped_remote,
+                     min_age / 3600)
+        diag.update({"evicted": evicted, "freed_bytes": freed,
+                     "skipped_remote": skipped_remote,
+                     "reason": "ran" if evicted else "no_eligible_files"})
+        self._last_evict = diag
 
     def archive_sweep(self) -> None:
         """Archive transcribed-but-unarchived files (with per-file backoff), then
