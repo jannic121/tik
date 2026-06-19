@@ -316,6 +316,9 @@
   <div class="panel-head">
     <h2>Files</h2>
     <div class="actions">
+      <input id="files-filter" placeholder="Filter by name / creator…" oninput="renderFiles()"
+             style="background:#161616;border:1px solid #2a2a2a;border-radius:5px;color:#ddd;
+                    padding:5px 9px;font-size:12px;width:200px;"/>
       <button class="ghost" onclick="runUploadNow()" title="Scan all backends and transfer any pending files now">↑ Upload now</button>
       <button class="ghost" onclick="loadFiles()">Refresh</button>
     </div>
@@ -1048,7 +1051,7 @@ async function loadWatchers() {
         <td class="dim">${w.automatic_interval_min}m</td>
         <td>${chatCell}</td>
         <td>${f>0?`<span style="color:#fa6">${f}</span>`:'0'}</td>
-        <td class="dim" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(w.last_error||'')}</td>
+        <td class="dim" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.last_error||'')}">${esc(w.last_error||'')}</td>
         <td class="dim">${fmtAgo(w.created_at)}</td>
         <td style="white-space:nowrap;">${reenable}<button class="danger" onclick="deleteWatcher('${esc(w.username)}')">Remove</button></td>
       </tr>`;
@@ -1185,15 +1188,15 @@ async function deleteWatcher(username) {
 }
 
 // ── Files ─────────────────────────────────────────────────────────
+let _filesCache=null, _highlightFile=null;
+
 async function loadFiles() {
   const r=await api('/api/files'); if(!r) return;
   const data=await r.json();
-  const el=$('files-content');
-  if (!data.length){el.innerHTML='<div class="empty">No files. Recordings appear here as creators go live.</div>';return;}
 
   // Fetch transcript + transfer statuses + live storage locations in parallel
   let ts={}, xfr={}, prog={}, locs={};
-  try {
+  if (data.length) try {
     const [tr,tx,tp,tl]=await Promise.all([
       api('/api/transcript-statuses'),
       api('/api/transfer-statuses'),
@@ -1206,9 +1209,30 @@ async function loadFiles() {
     if(tl&&tl.ok) locs=await tl.json();
   } catch(_){}
 
+  _filesCache={data,ts,xfr,prog,locs};
+  renderFiles();
+}
+
+// Jump to a file from another tab (e.g. transcript search) and flash its row.
+function gotoFile(filename){
+  const fn=(filename||'').split('/').pop();
+  _highlightFile=fn;
+  const fi=$('files-filter'); if(fi) fi.value=fn;
+  switchTab('files');   // triggers loadFiles(), which honours the filter + highlight
+}
+
+function renderFiles(){
+  if(!_filesCache) return;
+  const {data,ts,xfr,prog,locs}=_filesCache;
+  const el=$('files-content');
+  if (!data.length){el.innerHTML='<div class="empty">No files. Recordings appear here as creators go live.</div>';return;}
+  const q=($('files-filter')?.value||'').trim().toLowerCase();
+  const items = q ? data.filter(f=>((f.path||'').split('/').pop()+' '+(f.username||'')).toLowerCase().includes(q)) : data;
+  if(!items.length){el.innerHTML=`<div class="empty">No files match <strong>${esc(q)}</strong>.</div>`;return;}
+
   el.innerHTML=`<table>
     <thead><tr><th>Username</th><th>Backend</th><th>File</th><th>Size</th><th>Modified</th><th>Storage</th><th>Transcript</th><th></th></tr></thead>
-    <tbody>${data.map(f=>{
+    <tbody>${items.map(f=>{
       const fname=f.path.split('/').pop();
       const dlUrl = f.backend_pk
         ? `/api/files/download?backend_pk=${encodeURIComponent(f.backend_pk)}&path=${encodeURIComponent(f.path)}`
@@ -1266,7 +1290,7 @@ async function loadFiles() {
                           border-radius:3px;font-size:11px;text-decoration:none;margin-left:2px;">↓ .txt</a>`;
       }
 
-      return `<tr>
+      return `<tr data-fname="${esc(fname)}">
         <td><strong>${esc(f.username)}</strong></td>
         <td class="dim">${f.backend_pk ? esc(f.backend_label) : '<span style="color:#6ee7a7;font-size:11px;">on storage</span>'}</td>
         <td class="mono dim" style="font-size:11px;">${esc(fname)}</td>
@@ -1281,6 +1305,17 @@ async function loadFiles() {
           <button class="danger" onclick="deleteFile(${f.backend_pk?`'${f.backend_pk}'`:'null'},${JSON.stringify(f.path)},${f.storage_sid?`'${f.storage_sid}'`:'null'})">✕</button>
         </td>
       </tr>`;}).join('')}</tbody></table>`;
+
+  if(_highlightFile){
+    const want=_highlightFile; _highlightFile=null;
+    el.querySelectorAll('tr[data-fname]').forEach(tr=>{
+      if(tr.getAttribute('data-fname')===want){
+        tr.scrollIntoView({block:'center'});
+        tr.style.transition='background .4s'; tr.style.background='#2d3a4a';
+        setTimeout(()=>{tr.style.background='';},1600);
+      }
+    });
+  }
 }
 
 
@@ -1708,9 +1743,12 @@ async function doSearch() {
         <td class="mono dim" style="font-size:11px;">${esc(r.filename)}</td>
         <td style="max-width:480px;font-size:12px;line-height:1.5;color:#c0c0c0;">${snippet}</td>
         <td class="dim" style="font-size:11px;">${esc(r.storage_label||'—')}</td>
-        <td><button onclick="viewTranscript(${JSON.stringify(r.filename)})"
+        <td style="white-space:nowrap;"><button onclick="viewTranscript(${JSON.stringify(r.filename)})"
               style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;
-                     border-radius:3px;font-size:11px;cursor:pointer;">View</button></td>
+                     border-radius:3px;font-size:11px;cursor:pointer;">View</button>
+          <button onclick="gotoFile(${JSON.stringify(r.filename)})" title="Show this recording in the Files tab"
+              style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;
+                     border-radius:3px;font-size:11px;cursor:pointer;margin-left:2px;">→ File</button></td>
       </tr>`;}).join('')}</tbody></table>`;
 }
 

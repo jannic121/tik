@@ -640,9 +640,12 @@ class TranscriptionWorker:
                     continue
                 size = item.get("Size")
                 try:
+                    # Present by name. If the listing reports a size it must match;
+                    # if it doesn't report one, presence is enough (the copy was
+                    # already checksum-verified by rclone at archive time).
                     return size is None or int(size) == mp4.stat().st_size
                 except (OSError, ValueError, TypeError):
-                    return True                  # name matches; can't compare size
+                    return False                 # can't confirm → never green-light deletion
             return False
         except Exception as e:
             log.warning("archive verify failed for %s: %s", mp4.name, e)
@@ -1735,6 +1738,9 @@ async def files_archive_status():
         except OSError:
             out[mp4.name] = {"archived": True, "remote": remote}
     return out
+
+
+@app.put("/files/{username}/{filename}", dependencies=[Depends(require_auth)])
 async def receive_file(username: str, filename: str, request: Request):
     """Receive an MP4 streamed via PUT from the control plane upload worker.
     Writes atomically: data → .tmp file, then rename to final path.

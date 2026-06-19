@@ -355,7 +355,6 @@ class WatcherProcess:
         }
 
     async def _stop_chat(self) -> None:
-        self._chat_task = self._chat_task
         if self._chat_proc and self._chat_proc.returncode is None:
             try:
                 os.killpg(os.getpgid(self._chat_proc.pid), signal.SIGTERM)
