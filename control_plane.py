@@ -144,6 +144,10 @@ STORAGE_DEPLOY_FILES  = ["provision_storage.sh", "transcription_worker.py", "VER
 # never affect the running control plane. See catalog/README.md.
 CATALOG_ENABLED = os.environ.get("CATALOG_ENABLED", "0") == "1"
 _catalog = None   # set in lifespan when enabled
+# Where the Files tab gets its list: "live" (poll every node, default) or "catalog"
+# (one indexed DB read — fast + resilient to a flaky node). Falls back to live if
+# the catalog is off or errors. Flip with FILES_SOURCE=catalog; ?source= overrides.
+FILES_SOURCE = os.environ.get("FILES_SOURCE", "live")
 
 # Strip ANSI/VT100 escape sequences from SSH output before sending to browser
 _ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -1792,8 +1796,55 @@ async def restart_errored_watchers():
 # ---------------------------------------------------------------------------
 # Files
 
+async def _files_from_catalog() -> list[dict]:
+    """Build the Files-tab list from the catalog instead of polling every node.
+    Same item shape as the live path, so the frontend is unchanged. Only recordings
+    with a retrievable copy (recorder- or storage-local) are listed; the download/
+    delete routing maps the catalog's store label back to the backend/storage id."""
+    async with _db_lock:
+        backends_by_label = {r["backend_id"]: r["id"]
+                             for r in db.execute("SELECT id, backend_id FROM backends").fetchall()}
+        stores_by_label = {r["label"]: r["id"]
+                           for r in db.execute("SELECT id, label FROM storage_servers").fetchall()}
+    recs = _catalog.conn.execute(
+        "SELECT id, filename, creator, byte_size, started_at FROM recordings "
+        "WHERE filename LIKE '%.mp4' ORDER BY started_at DESC LIMIT 5000").fetchall()
+    locs_by_rec: dict[str, list] = {}
+    for l in _catalog.conn.execute(
+            "SELECT recording_id, tier, store, key FROM blob_locations").fetchall():
+        locs_by_rec.setdefault(l["recording_id"], []).append(l)
+    out: list[dict] = []
+    for rec in recs:
+        if rec["filename"].endswith("_flv.mp4"):
+            continue
+        locs = locs_by_rec.get(rec["id"], [])
+        rec_loc = next((l for l in locs if l["tier"] == "local"
+                        and l["store"] in backends_by_label), None)
+        sto_loc = next((l for l in locs if l["tier"] == "local"
+                        and l["store"] in stores_by_label), None)
+        base = {"username": rec["creator"], "filename": rec["filename"],
+                "size_bytes": rec["byte_size"], "mtime": rec["started_at"] or 0}
+        if rec_loc:
+            out.append({**base, "backend_pk": backends_by_label[rec_loc["store"]],
+                        "backend_label": rec_loc["store"], "location": "recorder",
+                        "path": rec_loc["key"]})
+        elif sto_loc:
+            out.append({**base, "backend_pk": None, "backend_label": "—",
+                        "storage_sid": stores_by_label[sto_loc["store"]],
+                        "storage_label": sto_loc["store"], "location": "storage",
+                        "path": sto_loc["key"]})
+        # cloud-only / no live copy → omitted in v1 (no direct download yet)
+    return sorted(out, key=lambda x: x.get("mtime") or 0, reverse=True)
+
+
 @app.get("/api/files", dependencies=[Depends(require_login)])
-async def list_files():
+async def list_files(source: Optional[str] = None):
+    src = source or FILES_SOURCE
+    if src == "catalog" and _catalog is not None:
+        try:
+            return await _files_from_catalog()
+        except Exception:
+            log.exception("catalog-backed /api/files failed — falling back to live")
     async with _db_lock:
         rows = db.execute(
             "SELECT id, backend_id, url, auth_token FROM backends WHERE last_health_ok=1"
