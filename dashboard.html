@@ -779,6 +779,23 @@ async function reapNow(pk, btn) {
   } catch(e) { alert('Reap failed: '+e.message); if (btn){ btn.disabled=false; btn.textContent='Reap now'; } }
 }
 
+async function retryFailed(btn) {
+  if (!confirm('Re-queue all failed transfers? Best done after the storage worker is updated.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try { const r = await api('/api/transfers/retry-failed', {method:'POST'});
+    const x = (r&&r.ok) ? await r.json() : null;
+    alert(x ? `Re-queued ${x.retried} transfer(s).` : 'Retry failed'); loadCatalog();
+  } catch(e) { alert('Retry failed: '+e.message); }
+}
+async function clearFailed(btn) {
+  if (!confirm('Delete all failed transfer records? Recordings still on a recorder are re-discovered automatically.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try { const r = await api('/api/transfers/clear-failed', {method:'POST'});
+    const x = (r&&r.ok) ? await r.json() : null;
+    alert(x ? `Cleared ${x.cleared} record(s).` : 'Clear failed'); loadCatalog();
+  } catch(e) { alert('Clear failed: '+e.message); }
+}
+
 // ── Catalog (strangler shadow) ───────────────────────────────────
 async function loadCatalog() {
   const el = $('catalog-content');
@@ -795,6 +812,7 @@ async function loadCatalog() {
   const fr = await api('/api/flv-status');    const flv   = (fr&&fr.ok)? await fr.json() : null;
   const rr = await api('/api/catalog/readiness'); const ready = (rr&&rr.ok)? await rr.json() : null;
   const dk = await api('/api/disk-breakdown'); const disk = (dk&&dk.ok)? await dk.json() : null;
+  const tx = await api('/api/transfers/summary'); const txs = (tx&&tx.ok)? await tx.json() : null;
 
   const bs = stats.by_state||{}, jobs = stats.jobs||[];
   const backlog = jobs.filter(j=>j.kind==='transcribe'&&j.state==='ready')
@@ -853,6 +871,18 @@ async function loadCatalog() {
           <button class="ghost" style="font-size:11px;padding:3px 10px;" onclick="reapNow('${d.backend_pk}',this)">Reap now</button></div>`:''}
       </div>`;
     });
+  }
+
+  if (txs) {
+    const failed=txs.failed||0, done=txs.done||0, inflight=(txs.pending||0)+(txs.transferring||0);
+    html += `<h3 style="font-size:13px;color:#aaa;margin:18px 0 8px;">Transfers (recorder → storage)</h3>
+      <div style="font-size:13px;color:#ccc;">
+        <span style="margin-right:16px;">done: <b>${done.toLocaleString()}</b></span>
+        <span style="margin-right:16px;">in-flight: <b>${inflight.toLocaleString()}</b></span>
+        <span style="margin-right:12px;">failed: <b style="color:${failed?'#e0607a':'#ccc'}">${failed.toLocaleString()}</b></span>
+        ${failed?`<button class="ghost" style="font-size:11px;padding:3px 10px;" onclick="retryFailed(this)">Retry failed</button>
+          <button class="ghost" style="font-size:11px;padding:3px 10px;margin-left:6px;" onclick="clearFailed(this)">Clear failed</button>`:''}
+      </div>`;
   }
 
   if (drift && drift.parity) {

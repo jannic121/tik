@@ -2945,6 +2945,39 @@ async def transfer_statuses():
     return {r["filename"]: r["status"] for r in rows}
 
 
+@app.get("/api/transfers/summary", dependencies=[Depends(require_login)])
+async def transfers_summary():
+    """Transfer status counts (for the Transfers controls in the UI)."""
+    async with _db_lock:
+        rows = db.execute(
+            "SELECT status, COUNT(*) AS c FROM transfers GROUP BY status").fetchall()
+    return {r["status"]: r["c"] for r in rows}
+
+
+@app.post("/api/transfers/retry-failed", dependencies=[Depends(require_login)])
+async def transfers_retry_failed():
+    """Reset all failed transfers back to pending (attempts cleared) so the next
+    cycle re-attempts them — e.g. after updating an out-of-date storage worker.
+    Files no longer on the recorder will simply fail again and can be cleared."""
+    async with _db_lock:
+        n = db.execute(
+            "UPDATE transfers SET status='pending', attempts=0, error=NULL "
+            "WHERE status='failed'").rowcount
+        db.commit()
+    asyncio.create_task(_upload_cycle(), name="upload-after-retry")
+    return {"retried": n}
+
+
+@app.post("/api/transfers/clear-failed", dependencies=[Depends(require_login)])
+async def transfers_clear_failed():
+    """Delete failed transfer records (e.g. for recordings that no longer exist on
+    the recorder). They'll be re-discovered and re-queued if the file is still there."""
+    async with _db_lock:
+        n = db.execute("DELETE FROM transfers WHERE status='failed'").rowcount
+        db.commit()
+    return {"cleared": n}
+
+
 @app.post("/api/transfer/queue", dependencies=[Depends(require_login)])
 async def queue_transfer(backend_pk: str, path: str):
     """Manually queue a specific file for upload to the storage server."""
