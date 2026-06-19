@@ -1415,10 +1415,30 @@ app = FastAPI(title="TT Recorder", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 # Auth
 
+# Per-IP failed-login tracking: a progressive delay + lockout that makes online
+# password brute-forcing impractical without changing anything for normal use.
+_login_failures: dict[str, list] = {}   # ip -> [count, last_fail_ts]
+
+
 @app.post("/api/login")
-async def api_login(body: LoginRequest):
+async def api_login(body: LoginRequest, request: Request):
+    ip = request.client.host if request.client else "?"
+    now = time.time()
+    rec = _login_failures.get(ip)
+    if rec and now - rec[1] > 900:       # forget after 15 min of no failures
+        rec = None
+    fails = rec[0] if rec else 0
+    if fails >= 50:                      # hard stop for a sustained attack
+        raise HTTPException(429, "too many failed attempts; try again later")
+    if fails >= 5:                       # slow down after a few misses
+        await asyncio.sleep(min(5.0, 0.5 * fails))
+
     if not hmac.compare_digest(body.password, settings.password):
+        _login_failures[ip] = [fails + 1, now]
+        await asyncio.sleep(min(2.0, 0.25 * (fails + 1)))   # progressive delay
         raise HTTPException(401, "wrong password")
+
+    _login_failures.pop(ip, None)        # success clears the counter
     resp = JSONResponse({"ok": True})
     resp.set_cookie("session", _sign_session(),
                     httponly=True, samesite="lax",

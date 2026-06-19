@@ -97,12 +97,16 @@ fi
 echo "==> Generating env file"
 if [[ ! -f $ENV_FILE ]]; then
   WHISPER_AUTH_TOKEN=$(openssl rand -hex 32)
+  # Per-node web UI password. Generated random (NOT the 'yourpassword' default,
+  # which the worker would otherwise accept as a valid API credential).
+  STORAGE_UI_PASSWORD=$(openssl rand -hex 12)
   cat > $ENV_FILE <<EOF
 WHISPER_WATCH_DIR=$RECORDINGS_DIR
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_HOST=$BIND_ADDRESS
 WHISPER_PORT=8090
 WHISPER_AUTH_TOKEN=$WHISPER_AUTH_TOKEN
+STORAGE_UI_PASSWORD=$STORAGE_UI_PASSWORD
 WHISPER_SCAN_INTERVAL=30
 # Wait this long after a file stops changing before transcribing it, so a
 # colocated worker never transcribes a recording that's still being written.
