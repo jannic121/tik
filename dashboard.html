@@ -464,13 +464,14 @@
     <div id="ar-fields-filen" class="ar-fields" style="display:none;">
       <div class="row2"><label>Filen email<input id="ar-filen-email" placeholder="you@example.com"/></label>
         <label>Filen password<input id="ar-filen-pw" type="password"/></label></div>
-      <label>API key (required)
-        <input id="ar-filen-apikey" type="password" placeholder="from: filen export-api-key"/></label>
+      <div class="row2"><label>2FA code (only if your account has 2FA)<input id="ar-filen-2fa" placeholder="123456"/></label>
+        <label>API key (optional — auto-fetched if blank)<input id="ar-filen-apikey" type="password" placeholder="leave blank to fetch automatically"/></label></div>
       <div class="dim" style="font-size:12px;margin-top:4px;">
-        Files stay end-to-end encrypted. The Filen rclone backend needs all three —
-        email, password and an <b>API key</b>. Get the key once with the
-        <a href="https://github.com/FilenCloudDienste/filen-cli" target="_blank">Filen CLI</a>:
-        <code>filen export-api-key</code>. Needs rclone ≥ 1.73 on the storage box
+        Files stay end-to-end encrypted. The Filen rclone backend needs an <b>API key</b>;
+        leave it blank and the control plane will install the
+        <a href="https://github.com/FilenCloudDienste/filen-cli" target="_blank">Filen CLI</a>
+        on the storage box and run <code>export-api-key</code> for you (your password is
+        only used to fetch the key, never stored by us). Needs rclone ≥ 1.73 on the box
         (the provisioner installs the latest; older boxes: <code>rclone selfupdate</code>).
       </div>
     </div>
@@ -2269,7 +2270,8 @@ async function enableArchive() {
   else if (p==='b2'){ body.b2_account=$('ar-b2-account').value.trim(); body.b2_key=$('ar-b2-key').value; }
   else if (p==='dropbox'){ body.dropbox_token=$('ar-dbx-token').value.trim(); }
   else if (p==='filen'){ body.filen_email=$('ar-filen-email').value.trim();
-    body.filen_password=$('ar-filen-pw').value; body.filen_api_key=$('ar-filen-apikey').value.trim(); }
+    body.filen_password=$('ar-filen-pw').value; body.filen_2fa=$('ar-filen-2fa').value.trim();
+    body.filen_api_key=$('ar-filen-apikey').value.trim(); }
   else if (p==='raw'){ body.raw_config=$('ar-raw').value; }
   const btn=$('ar-btn'); const lbl=btn.textContent;
   await _streamArchive(`/api/storage/${sid}/archive-config`, body, btn, 'Working…');

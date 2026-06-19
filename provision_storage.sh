@@ -94,6 +94,15 @@ if ! command -v rclone >/dev/null 2>&1; then
     echo "    [WARN] rclone install failed — archive will be disabled until rclone is installed"
 fi
 
+# Filen CLI — only needed to export an API key for the Filen archive backend. The
+# control plane can also install this on demand, but pre-installing means the
+# "leave API key blank" auto-export works the moment you pick Filen in the UI.
+echo "==> Installing Filen CLI (for the optional Filen archive backend)"
+if ! command -v filen >/dev/null 2>&1; then
+  curl -sL https://filen.io/cli.sh | bash >/dev/null 2>&1 || \
+    echo "    [WARN] Filen CLI install failed — only matters if you archive to Filen"
+fi
+
 echo "==> Generating env file"
 if [[ ! -f $ENV_FILE ]]; then
   WHISPER_AUTH_TOKEN=$(openssl rand -hex 32)

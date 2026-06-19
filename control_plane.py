@@ -2706,7 +2706,8 @@ class ArchiveConfigRequest(BaseModel):
     dropbox_token: Optional[str] = None   # JSON from `rclone authorize "dropbox"`
     filen_email: Optional[str] = None     # Filen account email (E2E-encrypted; needs rclone >= 1.73)
     filen_password: Optional[str] = None  # Filen account password (obscured on the box)
-    filen_api_key: Optional[str] = None   # REQUIRED API key (obscured); from `filen export-api-key`
+    filen_2fa: Optional[str] = None       # optional 2FA code, used only when auto-exporting the key
+    filen_api_key: Optional[str] = None   # API key (obscured). Leave blank to auto-export it on the box.
     raw_config: Optional[str] = None      # full rclone.conf block (paste path)
     # archive behaviour
     archive_what: str = Field("mp4", pattern="^(mp4|txt|both)$")
@@ -2766,8 +2767,75 @@ def _build_rclone_conf(req: ArchiveConfigRequest) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _filen_derive_api_key(req: ArchiveConfigRequest, host: str, emit) -> Optional[str]:
+    """Log in to Filen on the storage box with the Filen CLI and export an API key,
+    so the operator never has to run the CLI by hand. Installs the CLI if missing.
+    Credentials are passed via env vars (base64'd in transit) and never written to
+    disk by us. Returns the key, or None on failure (operator can paste one instead)."""
+    import base64, re as _re
+    client = _ssh_connect(host, req.ssh_port, req.ssh_user, req.auth_method,
+                          req.ssh_password, req.ssh_key_path, emit)
+    if not client:
+        return None
+    try:
+        em = base64.b64encode((req.filen_email or "").encode()).decode()
+        pw = base64.b64encode((req.filen_password or "").encode()).decode()
+        twofa = (req.filen_2fa or "").strip()
+        twofa_line = f"export FILEN_2FA_CODE={shlex_quote(twofa)}\n" if twofa else ""
+        emit("==> No API key supplied — exporting one on the storage box via the Filen CLI ...\n")
+        script = f"""set +e
+export FILEN_EMAIL=$(echo {shlex_quote(em)} | base64 -d)
+export FILEN_PASSWORD=$(echo {shlex_quote(pw)} | base64 -d)
+{twofa_line}FILEN_BIN=$(command -v filen 2>/dev/null)
+if [ -z "$FILEN_BIN" ]; then
+  echo INSTALLING_FILEN_CLI
+  curl -sL https://filen.io/cli.sh | bash >/dev/null 2>&1
+  FILEN_BIN=$(command -v filen 2>/dev/null || ls /usr/local/bin/filen /usr/bin/filen "$HOME/.local/bin/filen" 2>/dev/null | head -1)
+fi
+if [ -z "$FILEN_BIN" ]; then echo NO_FILEN_CLI; exit 0; fi
+echo KEY_BEGIN
+"$FILEN_BIN" export-api-key </dev/null 2>&1
+echo KEY_END
+"""
+        _, so, _ = client.exec_command(script, timeout=240)
+        out = so.read().decode("utf-8", errors="replace")
+        if "INSTALLING_FILEN_CLI" in out:
+            emit("    installed the Filen CLI on the box.\n")
+        if "NO_FILEN_CLI" in out:
+            emit("    [ERROR] Could not find or install the Filen CLI (need curl + a working install).\n")
+            return None
+        body = out.split("KEY_BEGIN", 1)[-1].split("KEY_END", 1)[0]
+        m = _re.search(r"API Key for[^:]*:\s*([A-Za-z0-9]+)", body)
+        key = m.group(1) if m else None
+        if not key:                                  # fall back to the longest token
+            toks = _re.findall(r"[A-Za-z0-9]{40,}", body)
+            key = max(toks, key=len) if toks else None
+        if key:
+            emit(f"    exported an API key ({len(key)} chars).\n")
+            return key
+        emit("    [ERROR] Filen CLI ran but no API key was found. Output:\n")
+        emit("      " + body.strip()[-600:] + "\n")
+        return None
+    except Exception as e:
+        emit(f"    [ERROR] {type(e).__name__}: {e}\n")
+        return None
+    finally:
+        client.close()
+
+
 def _ssh_archive_config(req: ArchiveConfigRequest, host: str, emit) -> None:
     import base64
+    # Filen: if the operator left the API key blank, export one on the box for them.
+    if req.provider == "filen" and not (req.filen_api_key and req.filen_api_key.strip()):
+        if not (req.filen_email and req.filen_password):
+            emit("[ERROR] Filen needs at least an email and password.\n")
+            return
+        key = _filen_derive_api_key(req, host, emit)
+        if not key:
+            emit("[ERROR] Could not auto-export a Filen API key. Run `filen export-api-key`\n"
+                 "        yourself and paste the key into the API key field, then retry.\n")
+            return
+        req.filen_api_key = key
     conf = _build_rclone_conf(req)
     name = (req.remote_name.strip() or "archive") if req.provider != "raw" else \
         (re.search(r"\[([^\]]+)\]", req.raw_config).group(1) if req.raw_config else "archive")
