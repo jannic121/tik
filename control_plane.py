@@ -2790,9 +2790,17 @@ export FILEN_PASSWORD=$(echo {shlex_quote(pw)} | base64 -d)
 if [ -z "$FILEN_BIN" ]; then
   echo INSTALLING_FILEN_CLI
   curl -sL https://filen.io/cli.sh | bash >/dev/null 2>&1
-  FILEN_BIN=$(command -v filen 2>/dev/null || ls /usr/local/bin/filen /usr/bin/filen "$HOME/.local/bin/filen" 2>/dev/null | head -1)
+fi
+# The install script drops the binary at ~/.filen-cli/bin/filen, which is not on
+# PATH in a non-login shell — search the known locations explicitly.
+if [ -z "$FILEN_BIN" ]; then
+  FILEN_BIN=$(command -v filen 2>/dev/null || ls "$HOME/.filen-cli/bin/filen" /usr/local/bin/filen /usr/bin/filen "$HOME/.local/bin/filen" 2>/dev/null | head -1)
+fi
+if [ -z "$FILEN_BIN" ]; then
+  FILEN_BIN=$(find "$HOME" /usr/local /opt -maxdepth 5 -name filen -type f 2>/dev/null | head -1)
 fi
 if [ -z "$FILEN_BIN" ]; then echo NO_FILEN_CLI; exit 0; fi
+chmod +x "$FILEN_BIN" 2>/dev/null
 echo KEY_BEGIN
 "$FILEN_BIN" export-api-key </dev/null 2>&1
 echo KEY_END
