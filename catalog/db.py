@@ -446,3 +446,106 @@ class Catalog:
         with self._lock:
             self.conn.execute("DELETE FROM transcript_fts")
             self.conn.commit()
+
+    # ---- chat logs (metadata + fuzzy recording match) --------------------
+
+    def match_chat_to_recording(self, creator: Optional[str], started_at: Optional[float],
+                                window_sec: float = 1800.0) -> tuple:
+        """Fuzzy-match a chat log to a recording: same creator, nearest start time
+        within `window_sec`. Returns (recording_id, delta_seconds) or (None, None).
+        Chat capture and the recording start a little apart, so this never relies on
+        an exact timestamp."""
+        if not creator or started_at is None:
+            return None, None
+        row = self.conn.execute(
+            "SELECT id, ABS(started_at - ?) AS d FROM recordings "
+            "WHERE creator=? AND started_at IS NOT NULL "
+            "ORDER BY d ASC LIMIT 1", (started_at, creator)).fetchone()
+        if row and row["d"] is not None and row["d"] <= window_sec:
+            return row["id"], row["d"]
+        return None, None
+
+    def upsert_chat_log(self, *, filename: str, creator: Optional[str], store: Optional[str],
+                        started_at: Optional[float] = None, ended_at: Optional[float] = None,
+                        events: Optional[int] = None, comments: Optional[int] = None,
+                        gifts: Optional[int] = None) -> None:
+        """Record a chat log's metadata and (re)compute its fuzzy recording match."""
+        creator = (creator or "").lstrip("@").lower() or None
+        rec_id, delta = self.match_chat_to_recording(creator, started_at)
+        now = _now()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO chat_logs(filename, creator, store, started_at, ended_at, "
+                "events, comments, gifts, recording_id, match_delta, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(filename) DO UPDATE SET "
+                "creator=excluded.creator, store=excluded.store, "
+                "started_at=COALESCE(excluded.started_at, chat_logs.started_at), "
+                "ended_at=COALESCE(excluded.ended_at, chat_logs.ended_at), "
+                "events=excluded.events, comments=excluded.comments, gifts=excluded.gifts, "
+                "recording_id=excluded.recording_id, match_delta=excluded.match_delta, "
+                "updated_at=excluded.updated_at",
+                (filename, creator, store, started_at, ended_at, events, comments, gifts,
+                 rec_id, delta, now))
+            self.conn.commit()
+
+    def index_chat(self, filename: str, creator: Optional[str], store: Optional[str],
+                   content: str) -> None:
+        """Fold a chat log's text into chat_fts and mark it indexed."""
+        with self._lock:
+            self.conn.execute("DELETE FROM chat_fts WHERE filename=?", (filename,))
+            self.conn.execute(
+                "INSERT INTO chat_fts(filename, creator, store, content) VALUES(?,?,?,?)",
+                (filename, creator or "", store or "", content or ""))
+            self.conn.execute("UPDATE chat_logs SET indexed_at=? WHERE filename=?",
+                              (_now(), filename))
+            self.conn.commit()
+
+    def chat_indexed_filenames(self) -> set:
+        return {r["filename"] for r in
+                self.conn.execute("SELECT filename FROM chat_logs WHERE indexed_at IS NOT NULL")}
+
+    def chat_index_count(self) -> int:
+        try:
+            return self.conn.execute("SELECT COUNT(*) AS n FROM chat_fts").fetchone()["n"]
+        except sqlite3.OperationalError:
+            return 0
+
+    def search_chat(self, query: str, limit: int = 100) -> list[dict]:
+        """Full-text search indexed chat logs; returns the log + a context snippet,
+        plus its fuzzy-matched recording filename when known."""
+        match = self._fts_query(query)
+        if not match:
+            return []
+        rows = self.conn.execute(
+            "SELECT f.filename, f.creator, f.store, "
+            "       snippet(chat_fts, 3, '', '', ' … ', 12) AS snippet, "
+            "       c.recording_id, c.started_at, c.comments, r.filename AS rec_filename "
+            "FROM chat_fts f "
+            "LEFT JOIN chat_logs c ON c.filename = f.filename "
+            "LEFT JOIN recordings r ON r.id = c.recording_id "
+            "WHERE chat_fts MATCH ? ORDER BY rank LIMIT ?", (match, limit)).fetchall()
+        out = []
+        for r in rows:
+            out.append({"filename": r["filename"], "username": r["creator"] or "",
+                        "snippet": r["snippet"] or "", "storage_label": r["store"] or "",
+                        "mtime": r["started_at"], "comments": r["comments"],
+                        "recording_filename": r["rec_filename"]})
+        out.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
+        return out
+
+    def chat_for_recording(self, recording_id: str) -> Optional[dict]:
+        r = self.conn.execute(
+            "SELECT filename, creator, store, comments, match_delta "
+            "FROM chat_logs WHERE recording_id=? ORDER BY match_delta ASC LIMIT 1",
+            (recording_id,)).fetchone()
+        return dict(r) if r else None
+
+    def chat_match_map(self) -> dict:
+        """{recording_filename: chat_filename} for all matched chat logs — lets the
+        Files tab show a chat link per recording in one query."""
+        rows = self.conn.execute(
+            "SELECT c.filename AS chat, r.filename AS rec FROM chat_logs c "
+            "JOIN recordings r ON r.id = c.recording_id "
+            "WHERE c.recording_id IS NOT NULL").fetchall()
+        return {r["rec"]: r["chat"] for r in rows}

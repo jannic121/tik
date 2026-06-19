@@ -1245,22 +1245,24 @@ async function loadFiles() {
   const r=await api('/api/files'); if(!r) return;
   const data=await r.json();
 
-  // Fetch transcript + transfer statuses + live storage locations in parallel
-  let ts={}, xfr={}, prog={}, locs={};
+  // Fetch transcript + transfer statuses + live storage locations + chat matches
+  let ts={}, xfr={}, prog={}, locs={}, chatm={};
   if (data.length) try {
-    const [tr,tx,tp,tl]=await Promise.all([
+    const [tr,tx,tp,tl,cm]=await Promise.all([
       api('/api/transcript-statuses'),
       api('/api/transfer-statuses'),
       api('/api/transfer-progress'),
       api('/api/file-locations'),
+      api('/api/chat-matches'),
     ]);
     if(tr&&tr.ok) ts=await tr.json();
     if(tx&&tx.ok) xfr=await tx.json();
     if(tp&&tp.ok) prog=await tp.json();
     if(tl&&tl.ok) locs=await tl.json();
+    if(cm&&cm.ok) chatm=await cm.json();
   } catch(_){}
 
-  _filesCache={data,ts,xfr,prog,locs};
+  _filesCache={data,ts,xfr,prog,locs,chatm};
   renderFiles();
 }
 
@@ -1274,7 +1276,7 @@ function gotoFile(filename){
 
 function renderFiles(){
   if(!_filesCache) return;
-  const {data,ts,xfr,prog,locs}=_filesCache;
+  const {data,ts,xfr,prog,locs,chatm={}}=_filesCache;
   const el=$('files-content');
   if (!data.length){el.innerHTML='<div class="empty">No files. Recordings appear here as creators go live.</div>';return;}
   const q=($('files-filter')?.value||'').trim().toLowerCase();
@@ -1352,7 +1354,9 @@ function renderFiles(){
         <td style="display:flex;gap:4px;align-items:center;white-space:nowrap;">
           <a href="${dlUrl}" download="${esc(fname)}"
              style="background:#2a3a4a;color:#9cf;border:1px solid #3a5a7a;padding:4px 8px;
-                    border-radius:4px;font-size:12px;text-decoration:none;">↓ MP4</a>
+                    border-radius:4px;font-size:12px;text-decoration:none;">↓ MP4</a>${
+          chatm[fname] ? `<button onclick='openChatLog(${JSON.stringify(chatm[fname])},${JSON.stringify(f.username)})' title="open the matched chat log"
+             style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;">💬 chat</button>` : ''}
           <button class="danger" onclick="deleteFile(${f.backend_pk?`'${f.backend_pk}'`:'null'},${JSON.stringify(f.path)},${f.storage_sid?`'${f.storage_sid}'`:'null'})">✕</button>
         </td>
       </tr>`;}).join('')}</tbody></table>`;
@@ -1832,9 +1836,11 @@ async function loadChat() {
       <td style="text-align:right;">${c.gifts??'—'}</td>
       <td class="dim" style="font-size:11px;">${esc(c.storage_label||'—')}</td>
       <td class="dim" style="font-size:11px;">${fmtAgo(c.mtime)}</td>
-      <td><button onclick='openChatLog(${JSON.stringify(c.filename)},${JSON.stringify(c.username)})'
+      <td style="white-space:nowrap;"><button onclick='openChatLog(${JSON.stringify(c.filename)},${JSON.stringify(c.username)})'
             style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;
-                   border-radius:3px;font-size:11px;cursor:pointer;">View</button></td>
+                   border-radius:3px;font-size:11px;cursor:pointer;">View</button>${
+        c.recording_filename ? `<button onclick='gotoFile(${JSON.stringify(c.recording_filename)})' title="jump to the matched recording"
+            style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;margin-left:2px;">→ recording</button>` : ''}</td>
     </tr>`).join('')}</tbody></table>`;
 }
 
@@ -1848,17 +1854,27 @@ async function doChatSearch() {
   const results = await r.json();
   if (!results.length) { meta.textContent=''; el.innerHTML=`<div class="empty">No chat messages match <strong>${esc(q)}</strong>.</div>`; return; }
   const total = results.reduce((n,x)=>n+(x.match_count||0),0);
-  meta.textContent = `${total} match${total===1?'':'es'} across ${results.length} log${results.length===1?'':'s'} for "${q}"`;
+  meta.textContent = total
+    ? `${total} match${total===1?'':'es'} across ${results.length} log${results.length===1?'':'s'} for "${q}"`
+    : `${results.length} log${results.length===1?'':'s'} mention "${q}"`;
   const re = new RegExp('('+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
-  el.innerHTML = results.map(g => `<div class="card" style="border:1px solid #2a2a2a;border-radius:8px;padding:12px;margin-bottom:10px;">
-    <div style="display:flex;justify-content:space-between;align-items:baseline;">
-      <strong>${esc(g.username)}</strong>
-      <span class="dim" style="font-size:11px;">${esc(g.filename)} · ${g.match_count} match${g.match_count===1?'':'es'}
-        · <a href="#" onclick='openChatLog(${JSON.stringify(g.filename)},${JSON.stringify(g.username)});return false;' style="color:#6ee7a7;">open log</a></span>
-    </div>
-    <div style="margin-top:6px;font-size:12px;line-height:1.6;">
-      ${g.matches.map(m => `<div>${_eventLine(m, re)}</div>`).join('')}
-    </div></div>`).join('');
+  el.innerHTML = results.map(g => {
+    // Live fan-out gives per-event `matches`; the FTS index gives a `snippet`.
+    const body = (g.matches && g.matches.length)
+      ? g.matches.map(m => `<div>${_eventLine(m, re)}</div>`).join('')
+      : `<div style="color:#c0c0c0;">${esc(g.snippet||'').replace(re,'<mark style="background:#4a3800;color:#fc6;border-radius:2px;padding:0 2px;">$1</mark>')}</div>`;
+    const count = (g.match_count!=null) ? `${g.match_count} match${g.match_count===1?'':'es'}`
+                : (g.comments!=null ? `${g.comments} comments` : '');
+    const recLink = g.recording_filename
+      ? ` · <a href="#" onclick='gotoFile(${JSON.stringify(g.recording_filename)});return false;' style="color:#9cf;" title="jump to the matched recording">→ recording</a>` : '';
+    return `<div class="card" style="border:1px solid #2a2a2a;border-radius:8px;padding:12px;margin-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <strong>${esc(g.username)}</strong>
+        <span class="dim" style="font-size:11px;">${esc(g.filename)}${count?' · '+count:''}
+          · <a href="#" onclick='openChatLog(${JSON.stringify(g.filename)},${JSON.stringify(g.username)});return false;' style="color:#6ee7a7;">open log</a>${recLink}</span>
+      </div>
+      <div style="margin-top:6px;font-size:12px;line-height:1.6;">${body}</div></div>`;
+  }).join('');
 }
 
 const _ICON = {comment:'💬',gift:'🎁',like:'👍',join:'➡️',share:'↗️',follow:'⭐',

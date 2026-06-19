@@ -95,3 +95,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
     content,
     tokenize = 'unicode61'
 );
+
+-- Captured TikTok live chat logs (TK_<user>_<date_time>_chat.jsonl). Fuzzy-matched
+-- to a recording by creator + nearest start time (the two start seconds/minutes
+-- apart, so an exact filename match never works).
+CREATE TABLE IF NOT EXISTS chat_logs (
+    filename     TEXT PRIMARY KEY,
+    creator      TEXT,
+    store        TEXT,                       -- storage label that holds the log
+    started_at   REAL,
+    ended_at     REAL,
+    events       INTEGER,
+    comments     INTEGER,
+    gifts        INTEGER,
+    recording_id TEXT,                       -- fuzzy-matched recording, or NULL
+    match_delta  REAL,                       -- |chat_start - rec_start| seconds
+    indexed_at   REAL,                       -- when its text was folded into chat_fts
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_creator ON chat_logs(creator);
+CREATE INDEX IF NOT EXISTS idx_chat_rec     ON chat_logs(recording_id);
+
+-- Full-text search over chat comment/gift/nickname text, same idea as transcript_fts.
+CREATE VIRTUAL TABLE IF NOT EXISTS chat_fts USING fts5(
+    filename UNINDEXED,
+    creator  UNINDEXED,
+    store    UNINDEXED,
+    content,
+    tokenize = 'unicode61'
+);

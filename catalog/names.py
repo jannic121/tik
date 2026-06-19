@@ -48,3 +48,30 @@ def parse_recording_name(name: str) -> Optional[RecordingName]:
 def final_name(name: str) -> str:
     """The finalised .mp4 name for any recording filename (no-op if already final)."""
     return name[: -len(_FLV)] + ".mp4" if name.endswith(_FLV) else name
+
+
+_RE_CHAT = re.compile(
+    r"^TK_(?P<user>.+)_(?P<date>\d{4}\.\d{2}\.\d{2})_(?P<time>\d{2}-\d{2}-\d{2})_chat\.jsonl$"
+)
+
+
+class ChatName(NamedTuple):
+    creator: str                  # normalised: no leading @, lowercase
+    started_at: Optional[float]   # epoch seconds parsed from the name, or None
+
+
+def parse_chat_name(name: str) -> Optional[ChatName]:
+    """Parse a chat-log filename TK_<user>_<date>_<time>_chat.jsonl. The timestamp
+    is when chat capture started — close to, but not exactly, the recording's start,
+    which is why chat↔recording association needs fuzzy time matching."""
+    m = _RE_CHAT.match(name)
+    if not m:
+        return None
+    creator = m.group("user").lstrip("@").lower()
+    try:
+        started = time.mktime(
+            time.strptime(f"{m.group('date')}_{m.group('time')}", "%Y.%m.%d_%H-%M-%S")
+        )
+    except (ValueError, OverflowError):
+        started = None
+    return ChatName(creator=creator, started_at=started)

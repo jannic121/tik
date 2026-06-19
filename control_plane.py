@@ -1466,6 +1466,71 @@ async def _transcript_index_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _chat_index_cycle(batch: int = 30) -> dict:
+    """Catalog the chat logs on storage: upsert each log's metadata (recomputing its
+    fuzzy recording match every pass, since recordings may be cataloged later) and
+    fold not-yet-indexed comment text into chat_fts for fast search."""
+    if _catalog is None:
+        return {"logs": 0, "indexed": 0, "pending": 0}
+    servers = _storage_healthy()
+    if not servers:
+        return {"logs": 0, "indexed": 0, "pending": 0}
+    from catalog.names import parse_chat_name
+    logs: dict[str, dict] = {}            # filename -> storage server that has it
+    for s in servers:
+        code, body = await _tw_call(s, "GET", "/chat")
+        if code == 200 and isinstance(body, list):
+            for item in body:
+                fn = item.get("filename")
+                if fn and fn not in logs:
+                    logs[fn] = {"server": s, "item": item}
+    # Metadata + fuzzy match pass (cheap, local).
+    for fn, e in logs.items():
+        item = e["item"]
+        parsed = parse_chat_name(fn)
+        creator = (parsed.creator if parsed else None) or item.get("username")
+        started = (parsed.started_at if parsed and parsed.started_at is not None
+                   else item.get("started"))
+        await asyncio.to_thread(
+            _catalog.upsert_chat_log, filename=fn, creator=creator,
+            store=e["server"]["label"], started_at=started, ended_at=item.get("ended"),
+            events=item.get("events"), comments=item.get("comments"), gifts=item.get("gifts"))
+    # Text pass: index logs whose comments aren't in chat_fts yet.
+    already = await asyncio.to_thread(_catalog.chat_indexed_filenames)
+    todo = [(fn, e["server"]) for fn, e in logs.items() if fn not in already]
+    indexed = 0
+    for fn, s in todo[:batch]:
+        code, body = await _tw_call(s, "GET", "/chat/view",
+                                    params={"filename": fn, "limit": 20000})
+        if code != 200 or not isinstance(body, dict):
+            continue
+        parts = []
+        for ev in body.get("events", []):
+            for k in ("text", "nickname", "user", "gift"):
+                v = ev.get(k)
+                if v:
+                    parts.append(str(v))
+        parsed = parse_chat_name(fn)
+        creator = (parsed.creator if parsed else None) or body.get("username")
+        await asyncio.to_thread(_catalog.index_chat, fn, creator, s["label"], " ".join(parts))
+        indexed += 1
+    return {"logs": len(logs), "indexed": indexed, "pending": max(0, len(todo) - indexed)}
+
+
+async def _chat_index_loop() -> None:
+    """Background indexer: keep the chat FTS index + recording matches current."""
+    interval = int(os.environ.get("CHAT_INDEX_INTERVAL", "300"))
+    while True:
+        try:
+            if _catalog is not None:
+                res = await _chat_index_cycle()
+                if res["indexed"]:
+                    log.info("chat index: +%d (pending %d)", res["indexed"], res["pending"])
+        except Exception:
+            log.debug("chat index loop error (ignored)", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO,
@@ -1512,6 +1577,7 @@ async def lifespan(app: FastAPI):
             log.info("catalog shadow mode ENABLED (db=%s)", _catalog.path)
             asyncio.create_task(_catalog_shadow_loop(), name="catalog-shadow")
             asyncio.create_task(_transcript_index_loop(), name="transcript-index")
+            asyncio.create_task(_chat_index_loop(), name="chat-index")
         except Exception:
             log.exception("catalog init failed — continuing without it")
             _catalog = None
@@ -3579,6 +3645,15 @@ async def chat_files():
             item["storage_id"] = s["id"]
             item["storage_label"] = s["label"]
             out.append(item)
+    # Attach the fuzzy-matched recording filename to each log (chat -> recording).
+    if _catalog is not None and out:
+        try:
+            rec_to_chat = await asyncio.to_thread(_catalog.chat_match_map)
+            chat_to_rec = {c: r for r, c in rec_to_chat.items()}
+            for item in out:
+                item["recording_filename"] = chat_to_rec.get(item.get("filename"))
+        except Exception:
+            pass
     out.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     return out
 
@@ -3598,11 +3673,35 @@ async def chat_view(filename: str, q: str = None, type: str = None):
     raise HTTPException(404, "chat log not found")
 
 
+@app.get("/api/chat-index/status", dependencies=[Depends(require_login)])
+async def chat_index_status():
+    if _catalog is None:
+        return {"enabled": False, "indexed": 0}
+    return {"enabled": True,
+            "indexed": await asyncio.to_thread(_catalog.chat_index_count)}
+
+
+@app.get("/api/chat-matches", dependencies=[Depends(require_login)])
+async def chat_matches():
+    """{recording_filename: chat_filename} for fuzzy-matched logs — lets the Files
+    tab show a 💬 chat link per recording."""
+    if _catalog is None:
+        return {}
+    return await asyncio.to_thread(_catalog.chat_match_map)
+
+
 @app.get("/api/chat/search", dependencies=[Depends(require_login)])
 async def chat_search(q: str):
-    """Search chat logs across all healthy storage servers."""
+    """Search chat logs. Prefers the local chat FTS index (fast, offline-tolerant,
+    and carries the fuzzy-matched recording); falls back to live fan-out grep."""
     if not q.strip():
         return []
+    if _catalog is not None:
+        try:
+            if await asyncio.to_thread(_catalog.chat_index_count):
+                return await asyncio.to_thread(_catalog.search_chat, q, 200)
+        except Exception:
+            log.exception("chat FTS search failed — falling back to live")
     servers = _storage_healthy()
     if not servers:
         return []
