@@ -441,6 +441,7 @@
         <option value="s3">S3-compatible (AWS, R2, Wasabi, MinIO, Spaces)</option>
         <option value="b2">Backblaze B2</option>
         <option value="dropbox">Dropbox</option>
+        <option value="filen">Filen (end-to-end encrypted)</option>
         <option value="raw">Paste rclone config</option>
       </select>
     </label>
@@ -459,6 +460,16 @@
       <label>Dropbox token (JSON)
         <textarea id="ar-dbx-token" rows="3" placeholder='Run on any machine with a browser: rclone authorize "dropbox" — paste the {...} token here'></textarea>
       </label>
+    </div>
+    <div id="ar-fields-filen" class="ar-fields" style="display:none;">
+      <div class="row2"><label>Filen email<input id="ar-filen-email" placeholder="you@example.com"/></label>
+        <label>Filen password<input id="ar-filen-pw" type="password"/></label></div>
+      <label>API key (optional — use this instead of password if your account has 2FA)
+        <input id="ar-filen-apikey" type="password" placeholder="from Filen account settings"/></label>
+      <div class="dim" style="font-size:12px;margin-top:4px;">
+        Files stay end-to-end encrypted. Needs rclone ≥ 1.73 on the storage box (the
+        provisioner installs the latest; older boxes: <code>rclone selfupdate</code>).
+      </div>
     </div>
     <div id="ar-fields-raw" class="ar-fields" style="display:none;">
       <label>Full rclone.conf block
@@ -2187,7 +2198,7 @@ async function clearRouting(key) {
 // ── Cloud archive (3rd hop) ──────────────────────────────────────
 function onArchiveProviderChange() {
   const p = $('ar-provider').value;
-  ['s3','b2','dropbox','raw'].forEach(x =>
+  ['s3','b2','dropbox','filen','raw'].forEach(x =>
     $('ar-fields-'+x).style.display = (x===p) ? '' : 'none');
 }
 
@@ -2253,6 +2264,8 @@ async function enableArchive() {
     body.s3_region=$('ar-s3-region').value.trim(); body.s3_endpoint=$('ar-s3-endpoint').value.trim(); }
   else if (p==='b2'){ body.b2_account=$('ar-b2-account').value.trim(); body.b2_key=$('ar-b2-key').value; }
   else if (p==='dropbox'){ body.dropbox_token=$('ar-dbx-token').value.trim(); }
+  else if (p==='filen'){ body.filen_email=$('ar-filen-email').value.trim();
+    body.filen_password=$('ar-filen-pw').value; body.filen_api_key=$('ar-filen-apikey').value.trim(); }
   else if (p==='raw'){ body.raw_config=$('ar-raw').value; }
   const btn=$('ar-btn'); const lbl=btn.textContent;
   await _streamArchive(`/api/storage/${sid}/archive-config`, body, btn, 'Working…');

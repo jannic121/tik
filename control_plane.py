@@ -2692,7 +2692,7 @@ class ArchiveConfigRequest(BaseModel):
     auth_method: str = Field(..., pattern="^(password|key)$")
     ssh_password: Optional[str] = None
     ssh_key_path: Optional[str] = None
-    provider: str = Field(..., pattern="^(s3|b2|dropbox|raw)$")
+    provider: str = Field(..., pattern="^(s3|b2|dropbox|filen|raw)$")
     remote_name: str = "archive"
     remote_path: str = ""                 # bucket/path, e.g. "mybucket/tt-recordings"
     # provider-specific
@@ -2704,6 +2704,9 @@ class ArchiveConfigRequest(BaseModel):
     b2_account: Optional[str] = None
     b2_key: Optional[str] = None
     dropbox_token: Optional[str] = None   # JSON from `rclone authorize "dropbox"`
+    filen_email: Optional[str] = None     # Filen account email (E2E-encrypted; needs rclone >= 1.73)
+    filen_password: Optional[str] = None  # Filen account password (obscured on the box)
+    filen_api_key: Optional[str] = None   # optional API key (obscured); handy for 2FA accounts
     raw_config: Optional[str] = None      # full rclone.conf block (paste path)
     # archive behaviour
     archive_what: str = Field("mp4", pattern="^(mp4|txt|both)$")
@@ -2745,6 +2748,17 @@ def _build_rclone_conf(req: ArchiveConfigRequest) -> str:
         if not req.dropbox_token:
             raise HTTPException(400, "Dropbox needs a token (from `rclone authorize \"dropbox\"`)")
         lines += ["type = dropbox", f"token = {req.dropbox_token.strip()}"]
+    elif req.provider == "filen":
+        if not (req.filen_email and req.filen_password):
+            raise HTTPException(400, "Filen needs account email and password")
+        # password/api_key must be obscured (rclone obscure). We write placeholders
+        # here and obscure them on the storage box in _ssh_archive_config, so the
+        # plaintext never lands in the rclone.conf or this process's memory longer
+        # than needed. Filen is a native backend in rclone >= 1.73.
+        lines += ["type = filen", f"email = {req.filen_email.strip()}",
+                  "password = __FILEN_OBSCURE_PW__"]
+        if req.filen_api_key and req.filen_api_key.strip():
+            lines.append("api_key = __FILEN_OBSCURE_AK__")
     return "\n".join(lines) + "\n"
 
 
@@ -2756,6 +2770,24 @@ def _ssh_archive_config(req: ArchiveConfigRequest, host: str, emit) -> None:
     archive_remote = f"{name}:{req.remote_path.strip().lstrip('/')}"
     b64 = base64.b64encode(conf.encode()).decode()
     sudo = "" if req.ssh_user == "root" else "sudo -n "
+    # Filen needs its secrets obscured (rclone obscure) on the box. Do it there so
+    # plaintext never persists in the conf; the obscured output is URL-safe base64
+    # (A-Za-z0-9-_), so it is safe inside the sed replacement below.
+    filen_post = ""
+    if req.provider == "filen":
+        pw_b64 = base64.b64encode((req.filen_password or "").encode()).decode()
+        filen_post = (
+            f'FPW=$(echo {shlex_quote(pw_b64)} | base64 -d); '
+            f'OBS=$(rclone obscure "$FPW"); '
+            f'{sudo}sed -i "s|__FILEN_OBSCURE_PW__|$OBS|" {STORAGE_RCLONE_CONF}\n'
+        )
+        if req.filen_api_key and req.filen_api_key.strip():
+            ak_b64 = base64.b64encode(req.filen_api_key.strip().encode()).decode()
+            filen_post += (
+                f'FAK=$(echo {shlex_quote(ak_b64)} | base64 -d); '
+                f'OBSA=$(rclone obscure "$FAK"); '
+                f'{sudo}sed -i "s|__FILEN_OBSCURE_AK__|$OBSA|" {STORAGE_RCLONE_CONF}\n'
+            )
     env_kvs = [
         f"RCLONE_CONFIG={STORAGE_RCLONE_CONF}",
         f"ARCHIVE_REMOTE={archive_remote}",
@@ -2778,7 +2810,7 @@ def _ssh_archive_config(req: ArchiveConfigRequest, host: str, emit) -> None:
 echo '{b64}' | base64 -d | {sudo}tee {STORAGE_RCLONE_CONF} >/dev/null
 {sudo}chown {STORAGE_SERVICE_USER}:{STORAGE_SERVICE_USER} {STORAGE_RCLONE_CONF}
 {sudo}chmod 600 {STORAGE_RCLONE_CONF}
-{upsert}
+{filen_post}{upsert}
 {sudo}systemctl restart tt-transcription
 echo "ARCHIVE_CONFIG_DONE"
 """
@@ -2800,6 +2832,12 @@ echo "ARCHIVE_CONFIG_DONE"
                 f"sudo -u {STORAGE_SERVICE_USER} RCLONE_CONFIG={STORAGE_RCLONE_CONF} "
                 f"rclone listremotes 2>&1 | head", timeout=20)
             emit("    remotes: " + vo.read().decode("utf-8", errors="replace").strip() + "\n")
+            if req.provider == "filen":
+                _, rv, _ = client.exec_command("rclone version 2>&1 | head -1", timeout=15)
+                ver = rv.read().decode("utf-8", errors="replace").strip()
+                emit(f"    {ver}\n")
+                emit("    note: Filen is a native rclone backend from v1.73 — if the version\n"
+                     "          above is older, run `rclone selfupdate` on the storage box.\n")
             emit("\n==> Cloud archive enabled. New recordings will be archived after transcription.\n")
         else:
             emit("[ERROR] config script did not complete.\n")

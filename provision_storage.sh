@@ -131,8 +131,11 @@ WHISPER_FILE_TIMEOUT=0
 # ── 3rd-hop archive (optional) ──────────────────────────────────────
 # Push recordings to any cloud AFTER transcription, via rclone.
 # 1) Configure a remote once:  sudo -u $SERVICE_USER HOME=$INSTALL_DIR rclone config
-#    (creates e.g. a "dropbox:" remote — follow the OAuth prompt)
+#    (creates e.g. a "dropbox:" or end-to-end-encrypted "filen:" remote — Filen
+#     is a native backend in rclone >= 1.73, so run 'rclone selfupdate' if older)
 # 2) Set ARCHIVE_REMOTE below to "<remote>:<path>" and restart the service.
+#    (Easier: use the control plane's Cloud Archive form — it supports S3/B2/
+#     Dropbox/Filen and writes all of this for you over SSH.)
 # ARCHIVE_REMOTE=dropbox:tt-recordings
 # ARCHIVE_WHAT=mp4                 # mp4 | txt | both
 # ARCHIVE_DELETE_LOCAL=0           # 1 = enable disk-aware eviction of archived copies
