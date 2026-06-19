@@ -1433,8 +1433,10 @@ async def _transcript_index_cycle(batch: int = 40) -> dict:
     indexed = 0
     for fn, s in todo[:batch]:
         code, text = await _tw_call(s, "GET", "/transcripts/view", params={"filename": fn})
-        if code != 200 or not isinstance(text, str) or not text.strip():
-            continue
+        if code != 200 or not isinstance(text, str):
+            continue                       # fetch failed — retry next cycle
+        # An empty-but-done transcript is still indexed (as ""), so it isn't
+        # re-fetched from storage on every cycle forever.
         rec = await asyncio.to_thread(_catalog.find_by_filename, fn)
         if rec:
             creator, mtime = rec["creator"], rec["started_at"]
@@ -2449,7 +2451,7 @@ async def add_storage(url: str, token: str,
                 (body.get("disk_free_bytes"), body.get("model"),
                  body.get("queue_depth"), time.time(), sid),
             )
-            db.commit()
+        db.commit()   # persist ssh endpoint + (if reachable) health, even when probe failed
     return {"ok": True, "id": sid, "reachable": code == 200}
 
 
@@ -3293,15 +3295,15 @@ async def storage_oom_protect(sid: str):
     s = _storage_by_id(sid)
     if not s:
         raise HTTPException(404, "storage server not found")
-    host = _host_of(s["url"])
-    creds = _get_ssh_creds(host) if host else None
+    host, port = _ssh_target(s)
+    creds = _get_creds_mkey(host, port) if host else None
 
     def work(emit):
         if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
-            emit(f"No saved SSH credentials for {host}. Run one Push update for "
+            emit(f"No saved SSH credentials for {host}:{port}. Run one Push update for "
                  "this host in the Deploy tab first, then this becomes one click.\n")
             return
-        _ssh_oom_protect(host, creds.get("ssh_port") or 22,
+        _ssh_oom_protect(host, port,
                          creds.get("ssh_user") or "root",
                          creds.get("auth_method") or "key",
                          _decrypt_pw(creds.get("password_enc")),

@@ -213,7 +213,7 @@ systemctl restart tt-backend
 echo
 echo "==> Checking firewall"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  if ufw status | grep -qE "^$PORT.*ALLOW"; then
+  if ufw status | grep -qE "^$PORT(/tcp)?[[:space:]].*ALLOW"; then
     echo "    UFW: port $PORT is open. Good."
   else
     echo "    [WARN] UFW is active but port $PORT is not open."
