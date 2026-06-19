@@ -464,11 +464,14 @@
     <div id="ar-fields-filen" class="ar-fields" style="display:none;">
       <div class="row2"><label>Filen email<input id="ar-filen-email" placeholder="you@example.com"/></label>
         <label>Filen password<input id="ar-filen-pw" type="password"/></label></div>
-      <label>API key (optional — use this instead of password if your account has 2FA)
-        <input id="ar-filen-apikey" type="password" placeholder="from Filen account settings"/></label>
+      <label>API key (required)
+        <input id="ar-filen-apikey" type="password" placeholder="from: filen export-api-key"/></label>
       <div class="dim" style="font-size:12px;margin-top:4px;">
-        Files stay end-to-end encrypted. Needs rclone ≥ 1.73 on the storage box (the
-        provisioner installs the latest; older boxes: <code>rclone selfupdate</code>).
+        Files stay end-to-end encrypted. The Filen rclone backend needs all three —
+        email, password and an <b>API key</b>. Get the key once with the
+        <a href="https://github.com/FilenCloudDienste/filen-cli" target="_blank">Filen CLI</a>:
+        <code>filen export-api-key</code>. Needs rclone ≥ 1.73 on the storage box
+        (the provisioner installs the latest; older boxes: <code>rclone selfupdate</code>).
       </div>
     </div>
     <div id="ar-fields-raw" class="ar-fields" style="display:none;">

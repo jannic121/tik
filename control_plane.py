@@ -2706,7 +2706,7 @@ class ArchiveConfigRequest(BaseModel):
     dropbox_token: Optional[str] = None   # JSON from `rclone authorize "dropbox"`
     filen_email: Optional[str] = None     # Filen account email (E2E-encrypted; needs rclone >= 1.73)
     filen_password: Optional[str] = None  # Filen account password (obscured on the box)
-    filen_api_key: Optional[str] = None   # optional API key (obscured); handy for 2FA accounts
+    filen_api_key: Optional[str] = None   # REQUIRED API key (obscured); from `filen export-api-key`
     raw_config: Optional[str] = None      # full rclone.conf block (paste path)
     # archive behaviour
     archive_what: str = Field("mp4", pattern="^(mp4|txt|both)$")
@@ -2749,16 +2749,20 @@ def _build_rclone_conf(req: ArchiveConfigRequest) -> str:
             raise HTTPException(400, "Dropbox needs a token (from `rclone authorize \"dropbox\"`)")
         lines += ["type = dropbox", f"token = {req.dropbox_token.strip()}"]
     elif req.provider == "filen":
-        if not (req.filen_email and req.filen_password):
-            raise HTTPException(400, "Filen needs account email and password")
-        # password/api_key must be obscured (rclone obscure). We write placeholders
-        # here and obscure them on the storage box in _ssh_archive_config, so the
-        # plaintext never lands in the rclone.conf or this process's memory longer
-        # than needed. Filen is a native backend in rclone >= 1.73.
+        if not (req.filen_email and req.filen_password
+                and req.filen_api_key and req.filen_api_key.strip()):
+            raise HTTPException(400, "Filen needs email, password, AND an API key. "
+                                     "Get the key once with `filen export-api-key` from the "
+                                     "Filen CLI (https://github.com/FilenCloudDienste/filen-cli).")
+        # email is plaintext; password + api_key MUST be obscured (rclone obscure).
+        # We write placeholders here and obscure them on the storage box in
+        # _ssh_archive_config, so the plaintext never lands in rclone.conf or in
+        # this process's memory longer than needed. Filen is native in rclone >= 1.73,
+        # and its backend reads api_key from config — it does NOT derive it by login,
+        # so the api_key is required, not optional.
         lines += ["type = filen", f"email = {req.filen_email.strip()}",
-                  "password = __FILEN_OBSCURE_PW__"]
-        if req.filen_api_key and req.filen_api_key.strip():
-            lines.append("api_key = __FILEN_OBSCURE_AK__")
+                  "password = __FILEN_OBSCURE_PW__",
+                  "api_key = __FILEN_OBSCURE_AK__"]
     return "\n".join(lines) + "\n"
 
 
