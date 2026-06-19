@@ -8,6 +8,7 @@ Stdlib-only — no third-party imports here.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -382,4 +383,66 @@ class Catalog:
             "jobs": self.jobs_summary(),
             "last_backfill": self.meta_get("last_backfill"),
             "last_parity": self.meta_get("last_parity"),
+            "search_indexed": self.transcript_index_count(),
         }
+
+    # ---- transcript full-text index --------------------------------------
+
+    @staticmethod
+    def _fts_query(q: str) -> str:
+        """Turn arbitrary user input into a safe FTS5 MATCH expression: each
+        whitespace token becomes a quoted term (AND-ed). Quoting neutralises FTS5
+        operators so a stray '*', '"' or '(' can't raise a syntax error."""
+        toks = [t for t in re.findall(r"\w+", q, flags=re.UNICODE) if t]
+        return " ".join('"' + t + '"' for t in toks)
+
+    def index_transcript(self, filename: str, creator: Optional[str], content: str,
+                         store: Optional[str] = None, mtime: Optional[float] = None) -> None:
+        """Insert/replace a transcript's text in the FTS index (keyed by filename)."""
+        with self._lock:
+            self.conn.execute("DELETE FROM transcript_fts WHERE filename=?", (filename,))
+            self.conn.execute(
+                "INSERT INTO transcript_fts(filename, creator, store, mtime, content) "
+                "VALUES(?,?,?,?,?)",
+                (filename, creator or "", store or "", str(mtime or ""), content or ""))
+            self.conn.commit()
+
+    def indexed_filenames(self) -> set:
+        return {r["filename"] for r in
+                self.conn.execute("SELECT filename FROM transcript_fts").fetchall()}
+
+    def transcript_index_count(self) -> int:
+        try:
+            return self.conn.execute("SELECT COUNT(*) AS n FROM transcript_fts").fetchone()["n"]
+        except sqlite3.OperationalError:
+            return 0
+
+    def search_transcripts(self, query: str, limit: int = 100) -> list[dict]:
+        """Full-text search the indexed transcripts. Returns display-ready rows
+        with a highlighted-context snippet, newest first."""
+        match = self._fts_query(query)
+        if not match:
+            return []
+        rows = self.conn.execute(
+            "SELECT filename, creator, store, mtime, "
+            "       snippet(transcript_fts, 4, '', '', ' … ', 12) AS snippet "
+            "FROM transcript_fts WHERE transcript_fts MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (match, limit)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                mt = float(r["mtime"]) if r["mtime"] else None
+            except (TypeError, ValueError):
+                mt = None
+            out.append({"filename": r["filename"], "username": r["creator"] or "",
+                        "snippet": r["snippet"] or "", "mtime": mt,
+                        "storage_label": r["store"] or ""})
+        out.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
+        return out
+
+    def drop_transcript_index(self) -> None:
+        """Wipe the FTS index so the next indexing cycle rebuilds it from scratch."""
+        with self._lock:
+            self.conn.execute("DELETE FROM transcript_fts")
+            self.conn.commit()

@@ -366,6 +366,7 @@
       <button class="primary" onclick="doSearch()" style="min-width:80px;">Search</button>
     </div>
     <p id="sq-meta" style="font-size:12px;color:#666;margin:6px 0 0;"></p>
+    <p id="sq-index" style="font-size:11px;color:#666;margin:4px 0 0;"></p>
   </div>
   <div id="search-content"></div>
 </section>
@@ -772,7 +773,7 @@ function switchTab(name) {
     p=>p.classList.toggle('active', p.id==='panel-'+name));
   ({servers:loadServers, watchers:loadWatchers, files:loadFiles,
     transcription:loadTranscription, updates:loadUpdates, catalog:loadCatalog,
-    search:()=>{}, chat:loadChat, routing:loadRouting, deploy:()=>{}})[name]?.();
+    search:loadSearchIndex, chat:loadChat, routing:loadRouting, deploy:()=>{}})[name]?.();
 }
 
 // Servers tab = recorders + storage/transcription together.
@@ -1656,6 +1657,28 @@ async function deleteFile(bpk, path, storageSid) {
 }
 
 // ── Search ───────────────────────────────────────────────────────
+async function loadSearchIndex() {
+  const el = $('sq-index'); if (!el) return;
+  try {
+    const r = await api('/api/transcript-index/status');
+    if (!r) return;
+    const d = await r.json();
+    if (!d.enabled) { el.innerHTML = '<span class="dim">Live search (catalog index off).</span>'; return; }
+    el.innerHTML = `Search index: <strong>${d.indexed}</strong> transcript${d.indexed===1?'':'s'} `
+      + `· <a href="#" onclick="reindexTranscripts(event)" style="color:#6ee7a7;">Reindex</a>`;
+  } catch(_) {}
+}
+
+async function reindexTranscripts(ev) {
+  if (ev) ev.preventDefault();
+  const el = $('sq-index'); if (el) el.textContent = 'Reindexing…';
+  try {
+    const r = await api('/api/transcript-index/run-now', {method:'POST'});
+    if (r) { const d = await r.json(); }
+  } catch(_) {}
+  loadSearchIndex();
+}
+
 async function doSearch() {
   const q = $('sq-input').value.trim();
   if (!q) return;

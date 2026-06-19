@@ -1357,6 +1357,60 @@ async def _catalog_shadow_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _transcript_index_cycle(batch: int = 40) -> dict:
+    """Pull finished transcripts off storage once and fold their text into the
+    catalog's full-text index, so search is a fast local query. Indexes up to
+    `batch` not-yet-indexed transcripts per call (cheap, incremental)."""
+    if _catalog is None:
+        return {"indexed": 0, "pending": 0, "total_done": 0}
+    servers = _storage_healthy()
+    if not servers:
+        return {"indexed": 0, "pending": 0, "total_done": 0}
+    # filename -> first storage server that reports a 'done' transcript for it
+    done: dict[str, dict] = {}
+    for s in servers:
+        code, body = await _tw_call(s, "GET", "/transcripts/all-statuses")
+        if code == 200 and isinstance(body, dict):
+            for fn, st in body.items():
+                if st == "done" and fn not in done:
+                    done[fn] = s
+    already = await asyncio.to_thread(_catalog.indexed_filenames)
+    todo = [(fn, s) for fn, s in done.items() if fn not in already]
+    from catalog.names import parse_recording_name
+    indexed = 0
+    for fn, s in todo[:batch]:
+        code, text = await _tw_call(s, "GET", "/transcripts/view", params={"filename": fn})
+        if code != 200 or not isinstance(text, str) or not text.strip():
+            continue
+        rec = await asyncio.to_thread(_catalog.find_by_filename, fn)
+        if rec:
+            creator, mtime = rec["creator"], rec["started_at"]
+        else:
+            parsed = parse_recording_name(fn)
+            creator = parsed.creator if parsed else ""
+            mtime = parsed.started_at if parsed else None
+        await asyncio.to_thread(_catalog.index_transcript, fn, creator, text,
+                                s["label"], mtime)
+        indexed += 1
+    return {"indexed": indexed, "pending": max(0, len(todo) - indexed),
+            "total_done": len(done)}
+
+
+async def _transcript_index_loop() -> None:
+    """Background indexer: keep the transcript FTS index in step with storage."""
+    interval = int(os.environ.get("TRANSCRIPT_INDEX_INTERVAL", "180"))
+    while True:
+        try:
+            if _catalog is not None:
+                res = await _transcript_index_cycle()
+                if res["indexed"]:
+                    log.info("transcript index: +%d (pending %d)",
+                             res["indexed"], res["pending"])
+        except Exception:
+            log.debug("transcript index loop error (ignored)", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO,
@@ -1402,6 +1456,7 @@ async def lifespan(app: FastAPI):
             _catalog = Catalog()
             log.info("catalog shadow mode ENABLED (db=%s)", _catalog.path)
             asyncio.create_task(_catalog_shadow_loop(), name="catalog-shadow")
+            asyncio.create_task(_transcript_index_loop(), name="transcript-index")
         except Exception:
             log.exception("catalog init failed — continuing without it")
             _catalog = None
@@ -3318,11 +3373,50 @@ async def transfer_progress():
     return out
 
 
+@app.get("/api/transcript-index/status", dependencies=[Depends(require_login)])
+async def transcript_index_status():
+    """Coverage of the local transcript search index."""
+    if _catalog is None:
+        return {"enabled": False, "indexed": 0}
+    indexed = await asyncio.to_thread(_catalog.transcript_index_count)
+    return {"enabled": True, "indexed": indexed}
+
+
+@app.post("/api/transcript-index/run-now", dependencies=[Depends(require_login)])
+async def transcript_index_run_now():
+    """Index a batch of finished transcripts immediately."""
+    if _catalog is None:
+        raise HTTPException(404, "catalog is off (set CATALOG_ENABLED=1)")
+    return await _transcript_index_cycle()
+
+
+@app.post("/api/transcript-index/rebuild", dependencies=[Depends(require_login)])
+async def transcript_index_rebuild():
+    """Drop the index and re-index a first batch (rest follows in the background)."""
+    if _catalog is None:
+        raise HTTPException(404, "catalog is off (set CATALOG_ENABLED=1)")
+    await asyncio.to_thread(_catalog.drop_transcript_index)
+    return await _transcript_index_cycle()
+
+
 @app.get("/api/transcript-search", dependencies=[Depends(require_login)])
 async def transcript_search(q: str):
-    """Full-text search across transcripts on all healthy storage servers."""
+    """Full-text search across transcripts.
+
+    Prefers the local FTS index (one fast query, works even when a storage box is
+    offline). Falls back to live fan-out grep across storage servers when the
+    catalog is off or its index is still empty."""
     if not q.strip():
         return []
+    # Fast path: the catalog's full-text index.
+    if _catalog is not None:
+        try:
+            count = await asyncio.to_thread(_catalog.transcript_index_count)
+            if count:
+                hits = await asyncio.to_thread(_catalog.search_transcripts, q, 200)
+                return hits
+        except Exception:
+            log.exception("FTS transcript search failed — falling back to live")
     servers = _storage_healthy()
     if not servers:
         return []

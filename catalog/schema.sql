@@ -81,3 +81,17 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(state, run_after);
 CREATE INDEX IF NOT EXISTS idx_jobs_rec   ON jobs(kind, recording_id);
+
+-- Full-text search index for transcripts. The control plane pulls each finished
+-- .txt off storage once and indexes it here, so search is a single fast local
+-- query instead of fan-out grep across every storage box (which also breaks when
+-- a box is offline). Only `content` is tokenised/searchable; the rest is
+-- UNINDEXED metadata kept for display + routing back to the file.
+CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+    filename UNINDEXED,
+    creator  UNINDEXED,
+    store    UNINDEXED,
+    mtime    UNINDEXED,
+    content,
+    tokenize = 'unicode61'
+);
