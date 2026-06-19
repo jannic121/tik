@@ -752,6 +752,32 @@
   </div>
 </div>
 
+<!-- ===== Disk eviction modal ===== -->
+<div class="modal-bg" id="modal-evict">
+  <div class="modal">
+    <h3>Disk eviction</h3>
+    <div id="evict-server" class="dim" style="font-size:12px;margin-bottom:10px;"></div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+      <input type="checkbox" id="evict-on" style="width:auto;"/>
+      Reclaim disk: evict verified-on-cloud copies when the disk fills (oldest first; transcript kept)
+    </label>
+    <div class="row2" style="margin-top:10px;">
+      <label>Evict above (disk %)<input id="evict-high" type="number" min="1" max="100" value="85"/></label>
+      <label>down to (disk %)<input id="evict-low" type="number" min="0" max="100" value="70"/></label>
+    </div>
+    <label style="margin-top:8px;">Keep files hot for at least
+      <input id="evict-age" type="number" min="0" step="0.5" value="24" style="width:64px;"/> hours</label>
+    <p style="font-size:11px;color:#777;margin:8px 0 0;">
+      Only files already verified on the cloud are ever deleted. Uses this server's saved SSH
+      credentials — no cloud credentials needed.</p>
+    <pre id="evict-out" style="display:none;background:#111;border:1px solid #2a2a2a;border-radius:6px;padding:10px;margin-top:10px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap;"></pre>
+    <div class="btn-row">
+      <button class="cancel" onclick="closeModal('modal-evict')">Cancel</button>
+      <button class="primary" id="evict-apply" onclick="applyEviction()">Apply</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===== Add watcher modal ===== -->
 <div class="modal-bg" id="modal-watcher">
   <div class="modal">
@@ -2392,8 +2418,10 @@ async function loadArchive() {
             <td>${s.configured?(s.archived_count??0)+fail:'—'}</td>
             <td style="font-size:12px;">${reclaim}</td>
             <td class="dim" style="font-size:11px;">${s.last_evict?esc(s.last_evict):'—'}</td>
-            <td><button class="ghost" style="font-size:12px;padding:4px 10px;"
-                  onclick="pickArchiveServer('${s.id}')">${s.configured?'Edit':'Set up'}</button></td>
+            <td style="white-space:nowrap;"><button class="ghost" style="font-size:12px;padding:4px 10px;"
+                  onclick="pickArchiveServer('${s.id}')">${s.configured?'Edit':'Set up'}</button>${
+              s.configured ? `<button class="ghost" style="font-size:12px;padding:4px 10px;margin-left:4px;"
+                  onclick="openEvict('${s.id}')">Eviction</button>` : ''}</td>
           </tr>`;}).join('')}</tbody></table>`;
     }
   }
@@ -2403,6 +2431,41 @@ function pickArchiveServer(sid) {
   const sel = $('ar-server'); if (sel) sel.value = sid;
   onArchiveServerSelect();
   $('archive-config')?.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+let _evictSid = null;
+function openEvict(sid) {
+  const s = _archiveServers.find(x => x.id === sid);
+  if (!s) return;
+  if (!s.configured) { alert('Configure the archive on this server first, then eviction can be toggled.'); return; }
+  _evictSid = sid;
+  $('evict-server').innerHTML = `<strong>${esc(s.label)}</strong> → <span class="mono">${esc(s.remote||'archive')}</span>`;
+  $('evict-on').checked = !!s.delete_local;
+  $('evict-high').value = s.evict_high_pct || 85;
+  $('evict-out').style.display = 'none'; $('evict-out').textContent = '';
+  openModal('modal-evict');
+}
+
+async function applyEviction() {
+  if (!_evictSid) return;
+  const body = {
+    delete_local: $('evict-on').checked,
+    evict_high_pct: parseFloat($('evict-high').value || '85'),
+    evict_low_pct: parseFloat($('evict-low').value || '70'),
+    evict_min_age_sec: Math.round(parseFloat($('evict-age').value || '24') * 3600),
+    delete_delay_sec: 0,
+  };
+  const out = $('evict-out'), btn = $('evict-apply');
+  out.style.display = ''; out.textContent = ''; btn.disabled = true; btn.textContent = 'Applying…';
+  try {
+    const resp = await fetch(`/api/storage/${_evictSid}/archive-eviction`, {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!resp.ok) { out.textContent += `[ERROR] HTTP ${resp.status}\n` + await resp.text(); }
+    else { const rd = resp.body.getReader(), dec = new TextDecoder();
+      while(true){ const {value,done} = await rd.read(); if(done) break;
+        out.textContent += dec.decode(value,{stream:true}); out.scrollTop = out.scrollHeight; } }
+  } catch(e) { out.textContent += '\n[ERROR] ' + e.message; }
+  finally { btn.disabled = false; btn.textContent = 'Apply'; setTimeout(loadArchive, 1200); }
 }
 
 async function onArchiveServerSelect() {

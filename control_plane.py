@@ -3179,6 +3179,53 @@ echo "ARCHIVE_DISABLED"
         client.close()
 
 
+class EvictionRequest(BaseModel):
+    delete_local: bool      = False
+    evict_high_pct: float   = Field(85, ge=1, le=100)
+    evict_low_pct: float    = Field(70, ge=0, le=100)
+    evict_min_age_sec: int  = Field(86400, ge=0)
+    delete_delay_sec: int   = Field(0, ge=0)
+
+
+def _ssh_archive_eviction(host: str, port: int, user: str, auth_method: str,
+                          password, key_path, req: "EvictionRequest", emit) -> None:
+    """Update ONLY the disk-eviction env vars on the storage box and restart — no
+    rclone.conf rewrite, so eviction can be toggled without re-entering cloud
+    credentials. Eviction still only ever deletes copies verified on the remote."""
+    sudo = "" if user == "root" else "sudo -n "
+    kvs = [
+        f"ARCHIVE_DELETE_LOCAL={'1' if req.delete_local else '0'}",
+        f"ARCHIVE_EVICT_HIGH_PCT={req.evict_high_pct}",
+        f"ARCHIVE_EVICT_LOW_PCT={req.evict_low_pct}",
+        f"ARCHIVE_EVICT_MIN_AGE_SEC={req.evict_min_age_sec}",
+        f"ARCHIVE_DELETE_DELAY_SEC={req.delete_delay_sec}",
+    ]
+    upsert = "\n".join(
+        f'{sudo}sed -i "/^{kv.split("=")[0]}=/d" {STORAGE_ENV_FILE}; '
+        f'echo {shlex_quote(kv)} | {sudo}tee -a {STORAGE_ENV_FILE} >/dev/null'
+        for kv in kvs)
+    script = f"set -e\n{upsert}\n{sudo}systemctl restart tt-transcription\necho EVICTION_DONE\n"
+    client = _ssh_connect(host, port, user, auth_method, password, key_path, emit)
+    if not client:
+        return
+    try:
+        emit(f"==> Updating eviction on {host}:{port} "
+             f"(reclaim disk = {'ON' if req.delete_local else 'off'}) ...\n")
+        _, so, se = client.exec_command(script, timeout=60)
+        if "EVICTION_DONE" in so.read().decode("utf-8", errors="replace"):
+            if req.delete_local:
+                emit(f"==> Eviction enabled: delete verified-on-cloud copies when disk is above "
+                     f"{req.evict_high_pct}%, down to {req.evict_low_pct}%, keeping each file at "
+                     f"least {req.evict_min_age_sec//3600}h.\n")
+            else:
+                emit("==> Eviction disabled — local copies are kept.\n")
+            emit("    (Only files already verified on the cloud are ever deleted.)\n")
+        else:
+            emit("[ERROR] " + se.read().decode("utf-8", errors="replace")[-800:] + "\n")
+    finally:
+        client.close()
+
+
 def _run_archive_roundtrip(client, archive_remote: str, emit) -> bool:
     """Prove the archive remote actually works: write a tiny probe file, read it
     back, verify the bytes match, then delete it — all as the service user with
@@ -3421,6 +3468,27 @@ async def storage_archive_test(sid: str, req: dict):
         host, req.get("ssh_port", 22), req.get("ssh_user", "root"),
         req.get("auth_method", "key"), req.get("ssh_password"), req.get("ssh_key_path"))
     return _threaded_stream(lambda emit: _ssh_archive_test(host, req, emit))
+
+
+@app.post("/api/storage/{sid}/archive-eviction", dependencies=[Depends(require_login)])
+async def storage_archive_eviction(sid: str, req: EvictionRequest):
+    """One-click: enable/adjust disk eviction on an already-configured archive,
+    using saved SSH credentials so cloud credentials never need re-entry."""
+    s = _storage_by_id(sid)
+    if not s:
+        raise HTTPException(404, "storage server not found")
+    host, port = _ssh_target(s)
+    creds = _get_creds_mkey(host, port) if host else None
+    if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
+        raise HTTPException(400, "No saved SSH credentials for this server. Configure the "
+                                 "archive once (or run a Push update) so the credentials are "
+                                 "saved, then eviction is a one-click toggle.")
+    user = creds.get("ssh_user") or "root"
+    auth = creds.get("auth_method") or "key"
+    pw = _decrypt_pw(creds.get("password_enc"))
+    keyp = creds.get("key_path")
+    return _threaded_stream(
+        lambda emit: _ssh_archive_eviction(host, port, user, auth, pw, keyp, req, emit))
 
 
 # Compatibility shim: the Deploy tab's auto-register still calls this.
