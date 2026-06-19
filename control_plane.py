@@ -2838,6 +2838,11 @@ echo "ARCHIVE_CONFIG_DONE"
                 emit(f"    {ver}\n")
                 emit("    note: Filen is a native rclone backend from v1.73 — if the version\n"
                      "          above is older, run `rclone selfupdate` on the storage box.\n")
+            ok = _run_archive_roundtrip(client, archive_remote, emit)
+            if not ok:
+                emit("\n==> Archive is configured but the self-test did NOT pass — recordings\n"
+                     "    may not actually reach the cloud. Fix the issue above and re-test.\n")
+                return
             emit("\n==> Cloud archive enabled. New recordings will be archived after transcription.\n")
         else:
             emit("[ERROR] config script did not complete.\n")
@@ -2868,6 +2873,75 @@ echo "ARCHIVE_DISABLED"
             emit("==> Archive disabled (rclone.conf kept; remove it manually if you want).\n")
         else:
             emit("[ERROR] " + se.read().decode("utf-8", errors="replace")[-800:] + "\n")
+    finally:
+        client.close()
+
+
+def _run_archive_roundtrip(client, archive_remote: str, emit) -> bool:
+    """Prove the archive remote actually works: write a tiny probe file, read it
+    back, verify the bytes match, then delete it — all as the service user with
+    the box's rclone.conf. Catches bad auth, wrong path, an unwritable remote, or
+    an rclone too old for the backend (e.g. Filen needs >= 1.73), at config/test
+    time instead of during a silent 3am archive sweep. Returns True on success."""
+    su = f"sudo -u {STORAGE_SERVICE_USER} env RCLONE_CONFIG={STORAGE_RCLONE_CONF} "
+    script = f"""set +e
+DEST={shlex_quote(archive_remote.rstrip('/'))}
+MARK=".tt-archive-check-$(date +%s)-$$"
+WANT="tt-archive-check $(date -u +%Y-%m-%dT%H:%M:%SZ) $RANDOM"
+ERR=$(mktemp)
+if echo "$WANT" | {su}rclone rcat "$DEST/$MARK" 2>"$ERR"; then
+  GOT=$({su}rclone cat "$DEST/$MARK" 2>>"$ERR")
+  {su}rclone deletefile "$DEST/$MARK" >/dev/null 2>&1 || true
+  if [ "$WANT" = "$GOT" ]; then echo ARCHIVE_TEST_OK; else echo ARCHIVE_TEST_FAIL_VERIFY; fi
+else
+  echo ARCHIVE_TEST_FAIL_WRITE
+fi
+echo "----detail----"; tail -c 1400 "$ERR"; rm -f "$ERR"
+"""
+    emit(f"==> Archive self-test: writing a probe file to {archive_remote} and reading it back ...\n")
+    try:
+        _, so, _ = client.exec_command(script, timeout=120)
+        out = so.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        emit(f"    ? self-test could not run: {type(e).__name__}: {e}\n")
+        return False
+    detail = out.split("----detail----", 1)[-1].strip()
+    if "ARCHIVE_TEST_OK" in out:
+        emit("    ✓ verified: write + read-back + delete all succeeded — archive works.\n")
+        return True
+    if "ARCHIVE_TEST_FAIL_WRITE" in out:
+        emit("    ✗ FAILED to write to the remote — check credentials, path, or rclone version.\n")
+    elif "ARCHIVE_TEST_FAIL_VERIFY" in out:
+        emit("    ✗ wrote but the read-back did not match — remote is not storing data correctly.\n")
+    else:
+        emit("    ? inconclusive result.\n")
+    if detail:
+        emit("      detail: " + detail[-1200:] + "\n")
+    return False
+
+
+def _ssh_archive_test(host: str, req_ssh: dict, emit) -> None:
+    """Standalone re-check: read the configured ARCHIVE_REMOTE off the box and run
+    the write/read/delete roundtrip against it. Lets the operator confirm a remote
+    still works without reconfiguring it."""
+    sudo = "" if req_ssh.get("ssh_user") == "root" else "sudo -n "
+    client = _ssh_connect(host, req_ssh["ssh_port"], req_ssh["ssh_user"],
+                          req_ssh["auth_method"], req_ssh.get("ssh_password"),
+                          req_ssh.get("ssh_key_path"), emit)
+    if not client:
+        return
+    try:
+        _, so, _ = client.exec_command(
+            f"{sudo}grep '^ARCHIVE_REMOTE=' {STORAGE_ENV_FILE} 2>/dev/null | head -1 | cut -d= -f2-",
+            timeout=15)
+        remote = so.read().decode("utf-8", errors="replace").strip()
+        if not remote:
+            emit("[ERROR] No ARCHIVE_REMOTE configured on this server — enable archiving first.\n")
+            return
+        emit(f"==> Configured archive target: {remote}\n")
+        _run_archive_roundtrip(client, remote, emit)
+    except Exception as e:
+        emit(f"[ERROR] {type(e).__name__}: {e}\n")
     finally:
         client.close()
 
@@ -3032,6 +3106,19 @@ async def storage_archive_disable(sid: str, req: dict):
     if not host:
         raise HTTPException(404, "storage server not found")
     return _threaded_stream(lambda emit: _ssh_archive_disable(host, req, emit))
+
+
+@app.post("/api/storage/{sid}/archive-test", dependencies=[Depends(require_login)])
+async def storage_archive_test(sid: str, req: dict):
+    """Re-verify a configured archive remote with a live write/read/delete probe."""
+    host = _archive_host_for(sid)
+    if not host:
+        raise HTTPException(404, "storage server not found")
+    (req["ssh_port"], req["ssh_user"], req["auth_method"],
+     req["ssh_password"], req["ssh_key_path"]) = _resolve_ssh(
+        host, req.get("ssh_port", 22), req.get("ssh_user", "root"),
+        req.get("auth_method", "key"), req.get("ssh_password"), req.get("ssh_key_path"))
+    return _threaded_stream(lambda emit: _ssh_archive_test(host, req, emit))
 
 
 # Compatibility shim: the Deploy tab's auto-register still calls this.

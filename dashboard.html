@@ -515,6 +515,7 @@
 
     <div style="display:flex;gap:8px;margin-top:14px;">
       <button class="primary" id="ar-btn" onclick="enableArchive()">Configure &amp; enable</button>
+      <button class="ghost" onclick="testArchive()">Test archive now</button>
       <button class="danger" onclick="disableArchive()">Disable archiving</button>
     </div>
     <pre id="ar-out" style="display:none;background:#111;border:1px solid #2a2a2a;border-radius:6px;padding:10px;margin-top:12px;font-size:12px;max-height:280px;overflow:auto;white-space:pre-wrap;"></pre>
@@ -2270,6 +2271,12 @@ async function enableArchive() {
   const btn=$('ar-btn'); const lbl=btn.textContent;
   await _streamArchive(`/api/storage/${sid}/archive-config`, body, btn, 'Working…');
   btn.textContent=lbl;
+}
+
+async function testArchive() {
+  const sid = $('ar-server').value;
+  if (!sid) { alert('Select a storage server'); return; }
+  await _streamArchive(`/api/storage/${sid}/archive-test`, _archiveSsh(), null, 'Testing…');
 }
 
 async function disableArchive() {
