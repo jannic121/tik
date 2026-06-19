@@ -2483,8 +2483,13 @@ async def update_status():
             kind, tid = "recorder", e["recorder_id"]
         else:
             kind, tid = "storage", e["storage_id"]
+        # Up to date only if EVERY reachable role reports the expected build.
+        # Keying on reachability (not just "build is non-null") means a colocated
+        # box can't look current off its recorder alone while its transcription
+        # worker is stale or silently not reporting a build.
+        relevant = [e["builds"].get(role) for role in roles if e["reachable"].get(role)]
+        up_to_date = bool(relevant) and all(v == expected for v in relevant)
         known = [v for v in e["builds"].values() if v]
-        up_to_date = bool(known) and all(v == expected for v in known)
         reachable = any(e["reachable"].values())
         creds = _get_ssh_creds(h)
         has_creds = bool(creds and (creds.get("password_enc") or creds.get("key_path")))
