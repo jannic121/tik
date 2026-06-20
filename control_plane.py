@@ -2118,15 +2118,17 @@ async def delete_watcher(username: str):
 
 class WatcherMigrateIn(BaseModel):
     backend_pk: str
+    force: bool = False     # move even if the source can't confirm removal
 
 
 @app.post("/api/watchers/{username}/migrate", dependencies=[Depends(require_login)])
 async def migrate_watcher(username: str, body: WatcherMigrateIn):
     """Move a watcher from its current backend to another one.
 
-    Adds the watcher on the target backend first (preserving its interval and
-    chat-capture setting), and only removes it from the old backend once the
-    new one accepts it — so a failed move never drops the watcher entirely."""
+    Invariant: never leave the same creator recording on two backends. We add on
+    the target only after confirming the source can be cleaned up, and if the
+    source's removal can't be confirmed we roll the target add back (unless the
+    caller passes force=true to evacuate a dead backend on purpose)."""
     username = username.lstrip("@").strip().lower()
     async with _db_lock:
         cur = db.execute(
@@ -2149,15 +2151,26 @@ async def migrate_watcher(username: str, body: WatcherMigrateIn):
         raise HTTPException(409, "target backend is not healthy")
 
     # Pull the watcher's live settings off the source so the move is faithful.
+    # A successful listing also confirms the source is reachable — which we need
+    # before we can trust it to drop the old watcher.
     interval = cur["automatic_interval_min"]
     capture_chat = True
+    src_reachable = False
     code, body_src = await _call(cur["url"], cur["auth_token"], "GET", "/watchers")
     if code == 200 and isinstance(body_src, list):
+        src_reachable = True
         for it in body_src:
             if it.get("username") == username:
                 interval = it.get("automatic_interval_min", interval)
                 capture_chat = it.get("capture_chat", True)
                 break
+
+    if not src_reachable and not body.force:
+        raise HTTPException(
+            409,
+            "source backend is unreachable — can't confirm the existing watcher "
+            "will be stopped, which risks a duplicate recording when it recovers. "
+            "Retry when the source is healthy, or move anyway to evacuate it.")
 
     # 1. Add on the target backend.
     code, resp = await _call(tgt["url"], tgt["auth_token"], "POST", "/watchers",
@@ -2170,8 +2183,17 @@ async def migrate_watcher(username: str, body: WatcherMigrateIn):
         raise HTTPException(502 if code < 0 else code,
                             f"target backend refused: {resp}")
 
-    # 2. Remove from the old backend (best-effort — already added on target).
-    await _call(cur["url"], cur["auth_token"], "DELETE", f"/watchers/{username}")
+    # 2. Remove from the old backend and verify it's gone. 404 = already absent.
+    dcode, _ = await _call(cur["url"], cur["auth_token"], "DELETE",
+                           f"/watchers/{username}")
+    source_removed = dcode in (200, 204, 404)
+    if not source_removed and not body.force:
+        # Roll the target add back so we don't leave a duplicate behind.
+        await _call(tgt["url"], tgt["auth_token"], "DELETE", f"/watchers/{username}")
+        raise HTTPException(
+            502,
+            f"source backend did not confirm removal (status {dcode}); rolled back "
+            "the move to avoid a duplicate recording. Retry, or move anyway.")
 
     # 3. Re-point the DB.
     async with _db_lock:
@@ -2179,7 +2201,8 @@ async def migrate_watcher(username: str, body: WatcherMigrateIn):
                    (tgt["id"], username))
         db.commit()
     return {"ok": True, "username": username,
-            "backend_pk": tgt["id"], "backend_label": tgt["backend_id"]}
+            "backend_pk": tgt["id"], "backend_label": tgt["backend_id"],
+            "source_removed": source_removed}
 
 
 @app.post("/api/watchers/{username}/restart", dependencies=[Depends(require_login)])

@@ -145,6 +145,28 @@ def test_catalog_files_lists_a_cataloged_recording():
     assert any(i["filename"] == fn for i in items), [i.get("filename") for i in items]
 
 
+# ---- watcher migration guards --------------------------------------------
+
+def test_migrate_unknown_watcher_404():
+    r = _c.post("/api/watchers/nobody/migrate", json={"backend_pk": "x"})
+    assert r.status_code == 404, r.text
+
+
+def test_migrate_unknown_target_404():
+    # Seed a watcher pointing at an existing backend, aim it at a missing target.
+    cp.db.execute(
+        "INSERT OR IGNORE INTO backends (id,backend_id,url,auth_token,region,added_at,"
+        "last_health_check,last_health_ok,last_health_data) VALUES "
+        "('mb1','mig-1','http://127.0.0.1:8000','t','eu',?,?,1,'{}')",
+        (time.time(), time.time()))
+    cp.db.execute(
+        "INSERT OR IGNORE INTO watchers (username,backend_pk,automatic_interval_min,created_at)"
+        " VALUES ('migme','mb1',3,?)", (time.time(),))
+    cp.db.commit()
+    r = _c.post("/api/watchers/migme/migrate", json={"backend_pk": "does-not-exist"})
+    assert r.status_code == 404, r.text
+
+
 # ---- catalog cutover -----------------------------------------------------
 
 def test_default_files_source_is_catalog():

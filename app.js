@@ -503,15 +503,32 @@ async function openMigrate(username, currentPk) {
   sel.innerHTML = opts || '<option value="" disabled>no other backend registered</option>';
 }
 
-async function submitMigrate() {
+async function submitMigrate(force) {
   const pk=$('migrate-target').value, msg=$('migrate-msg');
   if(!pk){msg.textContent='Pick a target backend.';return;}
-  const btn=$('migrate-go'); btn.disabled=true; msg.textContent='Moving…';
+  const btn=$('migrate-go'); btn.disabled=true; msg.textContent=force?'Moving anyway…':'Moving…';
   const r=await api(`/api/watchers/${encodeURIComponent(_migrateUser)}/migrate`,
-    {method:'POST',body:JSON.stringify({backend_pk:pk})});
+    {method:'POST',body:JSON.stringify({backend_pk:pk,force:!!force})});
   btn.disabled=false;
-  if (r && r.ok){ closeModal('modal-migrate'); loadWatchers(); }
-  else { let t='migration failed'; try{t=(await r.json()).detail||t;}catch(e){} msg.textContent='✗ '+t; }
+  if (r && r.ok){
+    let d={}; try{ d=await r.json(); }catch(e){}
+    closeModal('modal-migrate'); loadWatchers();
+    if (d.source_removed===false)
+      alert('Moved — but the source backend never confirmed it dropped the old '
+        + 'watcher. If that box comes back online, remove the watcher there to '
+        + 'avoid recording the same creator twice.');
+    return;
+  }
+  let t='migration failed'; const status=r?r.status:0;
+  try{ t=(await r.json()).detail||t; }catch(e){}
+  // Source unreachable / unconfirmed removal → offer a deliberate override.
+  if (status===409 || status===502) {
+    msg.innerHTML = `✗ ${esc(t)}<div style="margin-top:8px;"><button class="danger" `
+      + `style="font-size:11px;padding:3px 10px;" onclick="submitMigrate(true)">`
+      + `Move anyway</button></div>`;
+  } else {
+    msg.textContent='✗ '+t;
+  }
 }
 
 // ── Files ─────────────────────────────────────────────────────────
@@ -1461,8 +1478,6 @@ async function loadCookies() {
 
     const keys = ck ? Object.keys(ck) : [];
     const hasSession = ck && (ck['sessionid_ss'] || ck['sessionid']);
-    const sessionVal = ck && (ck['sessionid_ss'] || ck['sessionid'] || '');
-    const idcVal = ck && (ck['tt-target-idc'] || '');
     const isEmpty = keys.length === 0;
 
     const statusDot = isEmpty
