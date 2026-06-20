@@ -2848,6 +2848,8 @@ async def archive_overview():
             entry["what"] = st.get("archive_what")
             entry["delete_local"] = st.get("archive_delete_local")
             entry["evict_high_pct"] = st.get("archive_evict_high_pct")
+            entry["evict_low_pct"] = st.get("archive_evict_low_pct")
+            entry["evict_min_age_sec"] = st.get("archive_evict_min_age_sec")
             entry["archived_count"] = st.get("archived_count")
             entry["archive_failed_count"] = st.get("archive_failed_count")
             entry["last_evict"] = st.get("last_evict")
@@ -3470,6 +3472,78 @@ async def storage_archive_test(sid: str, req: dict):
         host, req.get("ssh_port", 22), req.get("ssh_user", "root"),
         req.get("auth_method", "key"), req.get("ssh_password"), req.get("ssh_key_path"))
     return _threaded_stream(lambda emit: _ssh_archive_test(host, req, emit))
+
+
+@app.get("/api/archive-statuses", dependencies=[Depends(require_login)])
+async def archive_statuses():
+    """{filename: {archived, on_cloud, local, username, storage_sid, remote}} merged
+    across storage servers. Includes evicted (cloud-only) recordings."""
+    out: dict = {}
+    for s in _storage_healthy():
+        code, body = await _tw_call(s, "GET", "/files/archive-status")
+        if code != 200 or not isinstance(body, dict):
+            continue
+        for fn, info in body.items():
+            if fn in out:
+                continue
+            out[fn] = {"archived": True, "on_cloud": True,
+                       "local": bool(info.get("local", True)),
+                       "username": info.get("username", ""),
+                       "remote": info.get("remote"),
+                       "storage_sid": s["id"], "storage_label": s["label"]}
+    return out
+
+
+@app.get("/api/files/cloud-download")
+async def files_cloud_download(username: str, filename: str,
+                               storage_sid: Optional[str] = None,
+                               session: Optional[str] = Cookie(default=None)):
+    """Stream a recording back from the cloud archive (for evicted/cold files).
+    Proxies the storage worker's `rclone cat`. Tries the named server first, then
+    any other archive-configured server."""
+    if not _verify_session(session):
+        raise HTTPException(401, "login required")
+    servers = _storage_healthy()
+    ordered = ([s for s in servers if s["id"] == storage_sid] +
+               [s for s in servers if s["id"] != storage_sid])
+    for s in ordered:
+        hdrs = {}
+        if s.get("token"):
+            hdrs["Authorization"] = f"Bearer {s['token']}"
+        url = f"{s['url'].rstrip('/')}/archive/download"
+        client = httpx.AsyncClient(timeout=None)
+        try:
+            req = client.build_request("GET", url, headers=hdrs,
+                                       params={"username": username, "filename": filename})
+            r = await client.send(req, stream=True)
+            if r.status_code != 200:
+                await r.aclose(); await client.aclose(); continue
+
+            async def _stream(r=r, client=client):
+                try:
+                    async for chunk in r.aiter_bytes(65536):
+                        yield chunk
+                finally:
+                    await r.aclose(); await client.aclose()
+
+            return StreamingResponse(
+                _stream(), media_type="video/mp4",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+        except httpx.RequestError:
+            await client.aclose(); continue
+    raise HTTPException(404, "not available from any cloud archive")
+
+
+@app.post("/api/storage/{sid}/evict-now", dependencies=[Depends(require_login)])
+async def storage_evict_now(sid: str):
+    """Trigger the disk-eviction sweep immediately on a storage server."""
+    s = _storage_by_id(sid)
+    if not s:
+        raise HTTPException(404, "storage server not found")
+    code, body = await _tw_call(s, "POST", "/archive/evict-now")
+    if code != 200:
+        raise HTTPException(502, f"worker returned {code}: {body}")
+    return body
 
 
 @app.post("/api/storage/{sid}/archive-eviction", dependencies=[Depends(require_login)])

@@ -461,24 +461,26 @@ async function loadFiles() {
   const r=await api('/api/files'); if(!r) return;
   const data=await r.json();
 
-  // Fetch transcript + transfer statuses + live storage locations + chat matches
-  let ts={}, xfr={}, prog={}, locs={}, chatm={};
-  if (data.length) try {
-    const [tr,tx,tp,tl,cm]=await Promise.all([
+  // Statuses + locations + chat matches + cloud-archive status (incl. evicted files)
+  let ts={}, xfr={}, prog={}, locs={}, chatm={}, arch={};
+  try {
+    const [tr,tx,tp,tl,cm,ar]=await Promise.all([
       api('/api/transcript-statuses'),
       api('/api/transfer-statuses'),
       api('/api/transfer-progress'),
       api('/api/file-locations'),
       api('/api/chat-matches'),
+      api('/api/archive-statuses'),
     ]);
     if(tr&&tr.ok) ts=await tr.json();
     if(tx&&tx.ok) xfr=await tx.json();
     if(tp&&tp.ok) prog=await tp.json();
     if(tl&&tl.ok) locs=await tl.json();
     if(cm&&cm.ok) chatm=await cm.json();
+    if(ar&&ar.ok) arch=await ar.json();
   } catch(_){}
 
-  _filesCache={data,ts,xfr,prog,locs,chatm};
+  _filesCache={data,ts,xfr,prog,locs,chatm,arch};
   renderFiles();
 }
 
@@ -490,13 +492,32 @@ function gotoFile(filename){
   switchTab('files');   // triggers loadFiles(), which honours the filter + highlight
 }
 
+function _tsCell(fname, tst){
+  if(tst==='processing') return '<span style="background:#3a3a1a;color:#fc6;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Transcribing…</span>';
+  if(tst==='pending') return '<span style="background:#2a2a2a;color:#888;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Pending</span>';
+  if(tst==='done') return `<span style="background:#1a2e1a;color:#6ee7a7;font-size:11px;padding:2px 8px;border-radius:3px;">✓ Available</span>
+      <button onclick="viewTranscript(${JSON.stringify(fname)})"
+        style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;margin-left:4px;">View</button>
+      <a href="/api/transcript-download?filename=${encodeURIComponent(fname)}"
+         download="${esc(fname.replace('.mp4','_transcript.txt'))}"
+         style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;border-radius:3px;font-size:11px;text-decoration:none;margin-left:2px;">↓ .txt</a>`;
+  return '<span style="color:#555;font-size:12px;">No transcript</span>';
+}
+
 function renderFiles(){
   if(!_filesCache) return;
-  const {data,ts,xfr,prog,locs,chatm={}}=_filesCache;
+  const {data,ts,xfr,prog,locs,chatm={},arch={}}=_filesCache;
   const el=$('files-content');
-  if (!data.length){el.innerHTML='<div class="empty">No files. Recordings appear here as creators go live.</div>';return;}
+  // Merge in evicted (cloud-only) recordings: archived, no local copy, not already listed.
+  const localNames = new Set(data.map(f=>(f.path||'').split('/').pop()));
+  const cloudOnly = Object.entries(arch)
+    .filter(([fn,a])=> a && a.local===false && !localNames.has(fn))
+    .map(([fn,a])=>({username:a.username||'', filename:fn, path:fn, location:'cloud',
+                     storage_sid:a.storage_sid, size_bytes:null, mtime:0, _cloud:true}));
+  const all = data.concat(cloudOnly);
+  if (!all.length){el.innerHTML='<div class="empty">No files. Recordings appear here as creators go live.</div>';return;}
   const q=($('files-filter')?.value||'').trim().toLowerCase();
-  const items = q ? data.filter(f=>((f.path||'').split('/').pop()+' '+(f.username||'')).toLowerCase().includes(q)) : data;
+  const items = q ? all.filter(f=>((f.path||'').split('/').pop()+' '+(f.username||'')).toLowerCase().includes(q)) : all;
   if(!items.length){el.innerHTML=`<div class="empty">No files match <strong>${esc(q)}</strong>.</div>`;return;}
 
   el.innerHTML=`<table>
@@ -539,30 +560,33 @@ function renderFiles(){
                         border-radius:3px;font-size:11px;cursor:pointer;margin-left:4px;">Retry</button>`;
       }
 
-      // Transcript status cell
-      const tst=ts[fname]||'none';
-      let tsCell='';
-      if(tst==='none'){
-        tsCell='<span style="color:#555;font-size:12px;">No transcript</span>';
-      } else if(tst==='processing'){
-        tsCell='<span style="background:#3a3a1a;color:#fc6;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Transcribing…</span>';
-      } else if(tst==='pending'){
-        tsCell='<span style="background:#2a2a2a;color:#888;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Pending</span>';
-      } else if(tst==='done'){
-        tsCell=`<span style="background:#1a2e1a;color:#6ee7a7;font-size:11px;padding:2px 8px;border-radius:3px;">✓ Available</span>
-                <button onclick="viewTranscript(${JSON.stringify(fname)})"
-                  style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;
-                         border-radius:3px;font-size:11px;cursor:pointer;margin-left:4px;">View</button>
-                <a href="/api/transcript-download?filename=${encodeURIComponent(fname)}"
-                   download="${esc(fname.replace('.mp4','_transcript.txt'))}"
-                   style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;
-                          border-radius:3px;font-size:11px;text-decoration:none;margin-left:2px;">↓ .txt</a>`;
+      const tsCell=_tsCell(fname, ts[fname]||'none');
+      const chatBtn = chatm[fname] ? `<button onclick='openChatLog(${JSON.stringify(chatm[fname])},${JSON.stringify(f.username)})' title="open the matched chat log"
+             style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;">💬 chat</button>` : '';
+
+      // Cloud-only (evicted) recording — restore from the archive; no local copy.
+      if (f._cloud) {
+        const cdl = `/api/files/cloud-download?username=${encodeURIComponent(f.username)}&filename=${encodeURIComponent(fname)}`
+                  + (f.storage_sid?`&storage_sid=${encodeURIComponent(f.storage_sid)}`:'');
+        return `<tr data-fname="${esc(fname)}">
+          <td><strong>${esc(f.username)}</strong></td>
+          <td><span style="color:#c9f;font-size:11px;">☁ cloud only</span></td>
+          <td class="mono dim" style="font-size:11px;">${esc(fname)}</td>
+          <td class="dim">—</td><td class="dim">—</td>
+          <td><span style="background:#2a1f3a;color:#c9f;font-size:11px;padding:2px 8px;border-radius:3px;">☁ on cloud</span></td>
+          <td style="white-space:nowrap;">${tsCell}</td>
+          <td style="display:flex;gap:4px;align-items:center;white-space:nowrap;">
+            <a href="${cdl}" download="${esc(fname)}" title="download from the cloud archive"
+               style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:4px 8px;border-radius:4px;font-size:12px;text-decoration:none;">☁ download</a>${chatBtn}
+          </td></tr>`;
       }
 
+      const cloudBadge = (arch[fname] && arch[fname].on_cloud)
+        ? ` <span title="also archived on the cloud" style="color:#c9f;font-size:10px;">☁</span>` : '';
       return `<tr data-fname="${esc(fname)}">
         <td><strong>${esc(f.username)}</strong></td>
         <td class="dim">${f.backend_pk ? esc(f.backend_label) : '<span style="color:#6ee7a7;font-size:11px;">on storage</span>'}</td>
-        <td class="mono dim" style="font-size:11px;">${esc(fname)}</td>
+        <td class="mono dim" style="font-size:11px;">${esc(fname)}${cloudBadge}</td>
         <td>${fmtBytes(f.size_bytes)}</td>
         <td class="dim">${fmtTime(f.mtime)}</td>
         <td style="white-space:nowrap;">${xCell}</td>
@@ -570,9 +594,7 @@ function renderFiles(){
         <td style="display:flex;gap:4px;align-items:center;white-space:nowrap;">
           <a href="${dlUrl}" download="${esc(fname)}"
              style="background:#2a3a4a;color:#9cf;border:1px solid #3a5a7a;padding:4px 8px;
-                    border-radius:4px;font-size:12px;text-decoration:none;">↓ MP4</a>${
-          chatm[fname] ? `<button onclick='openChatLog(${JSON.stringify(chatm[fname])},${JSON.stringify(f.username)})' title="open the matched chat log"
-             style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;">💬 chat</button>` : ''}
+                    border-radius:4px;font-size:12px;text-decoration:none;">↓ MP4</a>${chatBtn}
           <button class="danger" onclick="deleteFile(${f.backend_pk?`'${f.backend_pk}'`:'null'},${JSON.stringify(f.path)},${f.storage_sid?`'${f.storage_sid}'`:'null'})">✕</button>
         </td>
       </tr>`;}).join('')}</tbody></table>`;
@@ -1653,8 +1675,27 @@ function openEvict(sid) {
   $('evict-server').innerHTML = `<strong>${esc(s.label)}</strong> → <span class="mono">${esc(s.remote||'archive')}</span>`;
   $('evict-on').checked = !!s.delete_local;
   $('evict-high').value = s.evict_high_pct || 85;
+  $('evict-low').value = (s.evict_low_pct != null) ? s.evict_low_pct : 70;
+  $('evict-age').value = (s.evict_min_age_sec != null) ? (s.evict_min_age_sec / 3600) : 24;
   $('evict-out').style.display = 'none'; $('evict-out').textContent = '';
   openModal('modal-evict');
+}
+
+async function evictNow() {
+  if (!_evictSid) return;
+  const out = $('evict-out'), btn = $('evict-now-btn');
+  out.style.display = ''; out.textContent = 'Running eviction sweep…\n';
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  try {
+    const r = await api(`/api/storage/${_evictSid}/evict-now`, {method:'POST'});
+    const d = (r && r.ok) ? await r.json() : null;
+    const le = d && d.last_evict;
+    out.textContent += le
+      ? (le.evicted ? `✓ Freed ${fmtBytes(le.freed_bytes)} across ${le.evicted} file(s).\n`
+                    : `Nothing freed — ${_fmtEvict(le)}.\n  ${_evictTitle(le)}\n`)
+      : 'Done.\n';
+  } catch(e) { out.textContent += '[ERROR] ' + e.message + '\n'; }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'Evict now'; } setTimeout(loadArchive, 1000); }
 }
 
 async function applyEviction() {

@@ -42,7 +42,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, FileResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -1058,6 +1058,8 @@ class TranscriptionWorker:
             "archived_count":    len(self._archived),
             "archive_failed_count": len(self._archive_failed),
             "archive_evict_high_pct": settings.archive_evict_high_pct if settings.archive_remote else None,
+            "archive_evict_low_pct": settings.archive_evict_low_pct if settings.archive_remote else None,
+            "archive_evict_min_age_sec": settings.archive_evict_min_age_sec if settings.archive_remote else None,
             "last_evict":        self._last_evict or None,
         }
 
@@ -1750,10 +1752,11 @@ async def files_archive_status():
     out: dict = {}
     if not settings.watch_dir.exists():
         return out
-    for mp4 in settings.watch_dir.rglob("*.mp4"):
-        marker = worker._archived_marker(mp4)
-        if not marker.exists():
-            continue
+    # Iterate the .archived MARKERS (not *.mp4), so evicted cloud-only recordings
+    # — whose local .mp4 is gone — are still reported. `local` says whether the
+    # mp4 is still on disk; `username` is needed to fetch it back from the cloud.
+    for marker in settings.watch_dir.rglob("*.archived"):
+        mp4 = marker.with_suffix(".mp4")
         remote = None
         try:
             for tok in marker.read_text().split():
@@ -1761,12 +1764,62 @@ async def files_archive_status():
                     remote = tok.split("=", 1)[1]
         except OSError:
             pass
+        entry = {"archived": True, "remote": remote,
+                 "username": marker.parent.name, "local": mp4.exists()}
         try:
-            out[mp4.name] = {"archived": True, "remote": remote,
-                             "archived_at": marker.stat().st_mtime}
+            entry["archived_at"] = marker.stat().st_mtime
         except OSError:
-            out[mp4.name] = {"archived": True, "remote": remote}
+            pass
+        out[mp4.name] = entry
     return out
+
+
+@app.post("/archive/evict-now", dependencies=[Depends(require_auth)])
+async def archive_evict_now():
+    """Run the disk-eviction sweep immediately instead of waiting for the next
+    scan. Returns the diagnostic so the caller can see what (if anything) freed."""
+    if not settings.archive_remote:
+        raise HTTPException(400, "cloud archive is not configured on this server")
+    await asyncio.to_thread(worker._evict_if_pressured)
+    return {"ok": True, "last_evict": worker._last_evict}
+
+
+@app.get("/archive/download", dependencies=[Depends(require_auth)])
+async def archive_download(username: str = Query(...), filename: str = Query(...)):
+    """Stream a recording back from the cloud archive via `rclone cat`, so an
+    evicted (cloud-only) file can still be downloaded. Uses the worker's own
+    RCLONE_CONFIG (set in the env file), so no extra credentials are needed."""
+    if not settings.archive_remote:
+        raise HTTPException(400, "cloud archive is not configured on this server")
+    for seg in (username, filename):
+        if "/" in seg or "\\" in seg or ".." in seg or seg in ("", ".", ".."):
+            raise HTTPException(400, "invalid path segment")
+    remote = f"{settings.archive_remote.rstrip('/')}/{username}/{filename}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rclone", "cat", remote,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError:
+        raise HTTPException(500, "rclone not installed")
+
+    async def _stream():
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+    return StreamingResponse(
+        _stream(), media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.put("/files/{username}/{filename}", dependencies=[Depends(require_auth)])
