@@ -234,13 +234,14 @@ async function loadBackends() {
   const el = $('backends-content');
   if (!data.length) { el.innerHTML='<div class="empty">No backends yet. Click <strong>Add backend</strong> to register one.</div>'; return; }
 
-  // Fetch storage servers to detect colocation (same hostname = same VPS)
-  let storageHosts = new Set();
+  // Colocation = SAME MACHINE (ssh_host:ssh_port), not just same public IP — so two
+  // separate servers behind one NAT'd IP on different ports aren't confused.
+  let storageMachines = new Set();
   try {
     const sr = await api('/api/storage');
     if (sr && sr.ok) {
       const sl = await sr.json();
-      sl.forEach(s => { try { storageHosts.add(new URL(s.url).hostname); } catch(_){} });
+      sl.forEach(s => { if (s.machine) storageMachines.add(s.machine); });
     }
   } catch(_) {}
 
@@ -253,8 +254,8 @@ async function loadBackends() {
       const htxt=b.last_health_ok?'OK':(b.last_health_check?'OFFLINE':'UNKNOWN');
       const load=h.max_watchers!=null?`${h.active_watchers}/${h.max_watchers}`:'–';
       let bHost=''; try { bHost=new URL(b.url).hostname; } catch(_){}
-      const colocBadge = bHost && storageHosts.has(bHost)
-        ? `<span style="background:#1a2a3a;color:#9cf;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;" title="Same VPS also runs a storage/transcription server — this is one machine doing both roles">📦 colocated · ${esc(bHost)}</span>`
+      const colocBadge = (b.machine && storageMachines.has(b.machine))
+        ? `<span style="background:#1a2a3a;color:#9cf;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;" title="Same machine also runs a storage/transcription server — one box doing both roles">📦 colocated · ${esc(bHost)}</span>`
         : '';
       return `<tr>
         <td><strong>${esc(b.backend_id)}</strong>${colocBadge}</td>
@@ -1716,11 +1717,11 @@ async function loadRouting() {
   if (_routingData.backends.length) {
     html += `<h3 style="margin:18px 0 8px;font-size:14px;">Per-backend overrides</h3>
       <table><thead><tr><th>Backend</th><th>Send to</th><th>Recorder retention</th><th></th></tr></thead><tbody>`;
-    const shosts = new Set(_routingData.storages.map(s => _host(s.url)));
+    const smachines = new Set(_routingData.storages.map(s => s.machine).filter(Boolean));
     html += _routingData.backends.map(b => {
       const rule = _routingData.rules[b.id];
       const label = `${b.backend_id}${b.region?' ('+b.region+')':''}`;
-      const colo = shosts.has(_host(b.url))
+      const colo = (b.machine && smachines.has(b.machine))
         ? ' <span title="this recorder shares a disk with a storage server — its recordings are already on storage, so retention here is moot" style="background:#13302b;color:#6ee7a7;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:6px;">colocated</span>'
         : '';
       return _ruleRow(label, b.id, rule, colo);
@@ -2004,13 +2005,11 @@ async function loadStorage() {
       + 'or deploy a fresh one from the Deploy tab.</div>';
     return;
   }
-  // Detect colocation (same hostname = same VPS also acting as a recorder).
-  let recorderHosts = new Set();
+  // Colocation = SAME MACHINE (ssh_host:ssh_port), not just same public IP.
+  let recorderMachines = new Set();
   try {
     const br = await api('/api/backends');
-    if (br && br.ok) (await br.json()).forEach(b => {
-      try { recorderHosts.add(new URL(b.url).hostname); } catch(_){}
-    });
+    if (br && br.ok) (await br.json()).forEach(b => { if (b.machine) recorderMachines.add(b.machine); });
   } catch(_) {}
   el.innerHTML = `<table>
     <thead><tr><th>Server</th><th>URL</th><th>Status</th><th>Build</th><th>Model</th>
@@ -2025,8 +2024,8 @@ async function loadStorage() {
         ? `<span class="dim" style="font-size:11px;">${esc(s.build)}</span>`
         : (s.is_reachable ? '<span style="color:#d9a23b;font-size:11px;">old</span>' : '—');
       let sHost=''; try { sHost=new URL(s.url).hostname; } catch(_){}
-      const colocBadge = sHost && recorderHosts.has(sHost)
-        ? `<span style="background:#1a2a3a;color:#9cf;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;" title="Same VPS also runs a recorder — this is one machine doing both roles">📦 colocated · ${esc(sHost)}</span>`
+      const colocBadge = (s.machine && recorderMachines.has(s.machine))
+        ? `<span style="background:#1a2a3a;color:#9cf;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;" title="Same machine also runs a recorder — one box doing both roles">📦 colocated · ${esc(sHost)}</span>`
         : '';
       return `<tr>
         <td><strong>${esc(s.label||'—')}</strong>${colocBadge}</td>
@@ -2220,16 +2219,13 @@ async function loadPushTargets() {
       : 'Pushes watcher.py, app.py and chat_recorder.py, restarts tt-backend.';
     const r = await api('/api/backends'); if (!r) return;
     const bs = await r.json();
-    // For colocated, only show backends whose host also has a storage server
-    let storageHosts = new Set();
+    // For colocated, only show backends on the SAME machine as a storage server.
+    let storageMachines = new Set();
     if (kind === 'colocated') {
       const sr = await api('/api/storage');
-      if (sr && sr.ok) (await sr.json()).forEach(s => { try { storageHosts.add(new URL(s.url).hostname); } catch(_){} });
+      if (sr && sr.ok) (await sr.json()).forEach(s => { if (s.machine) storageMachines.add(s.machine); });
     }
-    const list = bs.filter(b => {
-      if (kind !== 'colocated') return true;
-      try { return storageHosts.has(new URL(b.url).hostname); } catch(_) { return false; }
-    });
+    const list = bs.filter(b => kind !== 'colocated' || (b.machine && storageMachines.has(b.machine)));
     if (!list.length) {
       sel.innerHTML = `<option value="">${kind==='colocated'?'No colocated servers found':'No backends registered'}</option>`;
       return;

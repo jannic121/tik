@@ -1802,6 +1802,9 @@ async def list_backends():
             "last_health_check": r["last_health_check"],
             "last_health_ok": bool(r["last_health_ok"]),
             "health": json.loads(r["last_health_data"]) if r["last_health_data"] else None,
+            # Machine identity (ssh_host:ssh_port) — colocation means SAME machine,
+            # not just same public IP, so two NAT'd servers aren't confused.
+            "machine": _mkey(*_ssh_target(r)),
         }
         for r in rows
     ]
@@ -2680,6 +2683,7 @@ async def list_storage():
             "model": s["last_model"],
             "queue_depth": s["last_queue"],
             "last_checked": s["last_checked"],
+            "machine": _mkey(*_ssh_target(s)),
         })
     return out
 
@@ -2961,15 +2965,18 @@ async def get_routing():
     """Return all backends, all storage servers, and the configured rules so the
     UI can render the routing table. Includes the implicit global default."""
     async with _db_lock:
-        backends = [dict(r) for r in db.execute(
-            "SELECT id, backend_id, region, url FROM backends ORDER BY added_at"
-        ).fetchall()]
+        brows = db.execute(
+            "SELECT id, backend_id, region, url, ssh_host, ssh_port FROM backends ORDER BY added_at"
+        ).fetchall()
+        backends = [{"id": r["id"], "backend_id": r["backend_id"], "region": r["region"],
+                     "url": r["url"], "machine": _mkey(*_ssh_target(r))} for r in brows]
         rules = {r["backend_pk"]: dict(r) for r in db.execute(
             "SELECT backend_pk, target_storage_pk, delete_mode, delete_delay_sec "
             "FROM routing_rules"
         ).fetchall()}
     storages = [{"id": s["id"], "label": s["label"], "url": s["url"],
-                 "healthy": bool(s["last_health_ok"])} for s in _storage_all()]
+                 "healthy": bool(s["last_health_ok"]), "machine": _mkey(*_ssh_target(s))}
+                for s in _storage_all()]
     default_rule = rules.get("*", {
         "backend_pk": "*", "target_storage_pk": None,
         "delete_mode": _default_delete_mode(), "delete_delay_sec": 0,
