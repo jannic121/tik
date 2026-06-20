@@ -114,9 +114,14 @@ didn't run. Fix: restart the control plane.
 
 ---
 
-## JavaScript architecture (embedded in control_plane.py)
+## JavaScript architecture (`app.js`, served separately)
 
-The entire frontend is a single `<script>` block inside `DASHBOARD_HTML`.
+The frontend JS lives in **`app.js`** (a real file next to `control_plane.py`),
+served at `/app.js` and referenced from `dashboard.html` via
+`<script src="/app.js?v=__BUILD__">`. It is loaded at startup into `APP_JS`, so
+**restart the control plane after editing `app.js`** (same as `dashboard.html`).
+It's a single classic (non-module) script, so all functions are globals and the
+inline `onclick="..."` handlers in `dashboard.html` keep working.
 **A JS syntax error silently breaks ALL tab switching and API calls.**
 
 Key functions:
@@ -132,23 +137,14 @@ Key functions:
 - `autoRegisterBackend(host, token)` — called after recorder deploy
 - `autoRegisterStorage(url, token)` — called after storage deploy
 
-**To check for JS syntax errors:**
+**To check for JS syntax errors** (now a direct lint of the real file):
 ```bash
-python3 -c "
-import re, os
-os.environ['CONTROL_PLANE_PASSWORD']='pw'
-os.environ['CONTROL_PLANE_DB']='/tmp/x.sqlite'
-os.environ['CONTROL_PLANE_SECRET_FILE']='/tmp/x.secret'
-import control_plane as cp
-from fastapi.testclient import TestClient
-c = TestClient(cp.app, follow_redirects=True)
-c.post('/api/login', json={'password':'pw'})
-page = c.get('/').text
-js = '\n'.join(re.findall(r'<script[^>]*>(.*?)</script>', page, re.DOTALL))
-open('/tmp/check.js','w').write(js)
-"
-node -e "try{new Function(require('fs').readFileSync('/tmp/check.js','utf8')); console.log('OK')}catch(e){console.log('ERROR:',e.message)}"
+node -e "try{new Function(require('fs').readFileSync('app.js','utf8')); console.log('OK')}catch(e){console.log('ERROR:',e.message)}"
 ```
+
+`app.js` ships alongside `control_plane.py` + `dashboard.html` — include it in
+any control-plane deploy (`cp control_plane.py dashboard.html app.js VERSION …`)
+and it's a required member of the self-update bundle.
 
 ---
 

@@ -2102,9 +2102,11 @@ async def self_update():
         except zipfile.BadZipFile:
             yield "✗ Not a valid zip file. Aborting.\n"
             return
-        if "control_plane.py" not in names or "dashboard.html" not in names:
+        missing_core = [f for f in ("control_plane.py", "dashboard.html", "app.js")
+                        if f not in names]
+        if missing_core:
             yield ("✗ This zip doesn't look like a tt-recorder bundle "
-                   "(missing control_plane.py/dashboard.html). Aborting.\n")
+                   f"(missing {', '.join(missing_core)}). Aborting.\n")
             return
         yield f"Archive OK — {len(names)} files.\n"
 
@@ -4300,12 +4302,22 @@ async def login_page(session: Optional[str] = Cookie(default=None)):
     return HTMLResponse(LOGIN_HTML)
 
 
+@app.get("/app.js")
+async def app_js():
+    """Serve the dashboard's JavaScript (split out of dashboard.html so it's a
+    real, lintable file). Cache-busted per build via the ?v=BUILD query string in
+    the <script> tag, so a long cache is safe; revalidate to be doubly sure."""
+    return Response(APP_JS, media_type="application/javascript; charset=utf-8",
+                    headers={"Cache-Control": "no-cache"})
+
+
 # ---------------------------------------------------------------------------
 # HTML
 
 LOGIN_HTML = _load_template("login.html")
 
 DASHBOARD_HTML = _load_template("dashboard.html")
+APP_JS = _load_template("app.js")
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
