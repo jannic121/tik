@@ -1814,8 +1814,27 @@ function openEvict(sid) {
   $('evict-high').value = s.evict_high_pct || 85;
   $('evict-low').value = (s.evict_low_pct != null) ? s.evict_low_pct : 70;
   $('evict-age').value = (s.evict_min_age_sec != null) ? (s.evict_min_age_sec / 3600) : 24;
+  if ($('ret-evict')) $('ret-evict').value = s.retention_evict_days || 0;
+  if ($('ret-purge')) $('ret-purge').value = s.retention_purge_days || 0;
   $('evict-out').style.display = 'none'; $('evict-out').textContent = '';
   openModal('modal-evict');
+}
+
+async function applyRetention() {
+  if (!_evictSid) return;
+  const purge = parseFloat($('ret-purge').value||'0');
+  if (purge > 0 && !confirm(`Permanently DELETE the cloud video of recordings older than ${purge} days?\nTranscripts and chat logs are kept, but the video can't be recovered.`)) return;
+  const body = { evict_days: parseFloat($('ret-evict').value||'0'), purge_days: purge };
+  const out = $('evict-out'); out.style.display=''; out.textContent='Applying retention…\n';
+  try {
+    const resp = await fetch(`/api/storage/${_evictSid}/retention`, {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!resp.ok) { out.textContent += `[ERROR] HTTP ${resp.status}\n` + await resp.text(); }
+    else { const rd = resp.body.getReader(), dec = new TextDecoder();
+      while(true){ const {value,done} = await rd.read(); if(done) break;
+        out.textContent += dec.decode(value,{stream:true}); out.scrollTop = out.scrollHeight; } }
+  } catch(e) { out.textContent += '\n[ERROR] ' + e.message; }
+  finally { setTimeout(loadArchive, 1200); }
 }
 
 async function evictNow() {

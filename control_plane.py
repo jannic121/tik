@@ -2876,6 +2876,8 @@ async def archive_overview():
             entry["evict_high_pct"] = st.get("archive_evict_high_pct")
             entry["evict_low_pct"] = st.get("archive_evict_low_pct")
             entry["evict_min_age_sec"] = st.get("archive_evict_min_age_sec")
+            entry["retention_evict_days"] = st.get("retention_evict_days")
+            entry["retention_purge_days"] = st.get("retention_purge_days")
             entry["archived_count"] = st.get("archived_count")
             entry["archive_failed_count"] = st.get("archive_failed_count")
             entry["last_evict"] = st.get("last_evict")
@@ -3215,6 +3217,43 @@ class EvictionRequest(BaseModel):
     evict_low_pct: float    = Field(70, ge=0, le=100)
     evict_min_age_sec: int  = Field(86400, ge=0)
     delete_delay_sec: int   = Field(0, ge=0)
+
+
+class RetentionRequest(BaseModel):
+    evict_days: float = Field(0, ge=0)    # drop local mp4 after N days (0 = off)
+    purge_days: float = Field(0, ge=0)    # delete cloud + local mp4 after M days (0 = off)
+
+
+def _ssh_retention(host: str, port: int, user: str, auth_method: str,
+                   password, key_path, req: "RetentionRequest", emit) -> None:
+    """Set the age-based lifecycle env vars on the storage box and restart. Both
+    policies keep the transcript + chat forever."""
+    sudo = "" if user == "root" else "sudo -n "
+    kvs = [f"RETENTION_EVICT_DAYS={req.evict_days}",
+           f"RETENTION_PURGE_DAYS={req.purge_days}"]
+    upsert = "\n".join(
+        f'{sudo}sed -i "/^{kv.split("=")[0]}=/d" {STORAGE_ENV_FILE}; '
+        f'echo {shlex_quote(kv)} | {sudo}tee -a {STORAGE_ENV_FILE} >/dev/null'
+        for kv in kvs)
+    script = f"set -e\n{upsert}\n{sudo}systemctl restart tt-transcription\necho RETENTION_DONE\n"
+    client = _ssh_connect(host, port, user, auth_method, password, key_path, emit)
+    if not client:
+        return
+    try:
+        emit(f"==> Setting retention on {host}:{port} "
+             f"(evict {req.evict_days or 'off'}d, purge {req.purge_days or 'off'}d) ...\n")
+        _, so, se = client.exec_command(script, timeout=60)
+        if "RETENTION_DONE" in so.read().decode("utf-8", errors="replace"):
+            emit("==> Done. ")
+            emit(f"Local video dropped after {req.evict_days}d.\n" if req.evict_days
+                 else "Age-based local eviction off.\n")
+            if req.purge_days:
+                emit(f"    Cloud video deleted after {req.purge_days}d (transcript + chat kept).\n")
+            emit("    Transcripts and chat logs are always kept.\n")
+        else:
+            emit("[ERROR] " + se.read().decode("utf-8", errors="replace")[-800:] + "\n")
+    finally:
+        client.close()
 
 
 def _ssh_archive_eviction(host: str, port: int, user: str, auth_method: str,
@@ -3591,6 +3630,22 @@ async def files_cloud_download(username: str, filename: str,
         except httpx.RequestError:
             await client.aclose(); continue
     raise HTTPException(404, "not available from any cloud archive")
+
+
+@app.post("/api/storage/{sid}/retention", dependencies=[Depends(require_login)])
+async def storage_retention(sid: str, req: RetentionRequest):
+    """One-click: set age-based retention (evict/purge days) using saved SSH creds."""
+    s = _storage_by_id(sid)
+    if not s:
+        raise HTTPException(404, "storage server not found")
+    host, port = _ssh_target(s)
+    creds = _get_creds_mkey(host, port) if host else None
+    if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
+        raise HTTPException(400, "No saved SSH credentials for this server. Configure the "
+                                 "archive once (or run a Push update) first.")
+    return _threaded_stream(lambda emit: _ssh_retention(
+        host, port, creds.get("ssh_user") or "root", creds.get("auth_method") or "key",
+        _decrypt_pw(creds.get("password_enc")), creds.get("key_path"), req, emit))
 
 
 @app.post("/api/storage/{sid}/evict-now", dependencies=[Depends(require_login)])

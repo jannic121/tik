@@ -790,6 +790,17 @@
       Only the <b>.mp4</b> is evicted, and only after it's verified on the cloud. Transcripts
       and chat logs are <b>always kept on disk</b> (so search keeps working). Oldest first;
       uses this server's saved SSH credentials — no cloud credentials needed.</p>
+    <details style="margin-top:12px;border-top:1px solid #2a2a2a;padding-top:10px;">
+      <summary style="cursor:pointer;font-size:13px;color:#9aa;">Age-based retention (lifecycle)</summary>
+      <div class="row2" style="margin-top:8px;">
+        <label>Drop local video after <input id="ret-evict" type="number" min="0" step="1" value="0" style="width:64px;"/> days
+          <span class="dim" style="font-size:11px;">(0 = off; stays on cloud)</span></label>
+        <label>Delete cloud video after <input id="ret-purge" type="number" min="0" step="1" value="0" style="width:64px;"/> days
+          <span class="dim" style="font-size:11px;">(0 = off; keeps txt + chat)</span></label>
+      </div>
+      <button class="ghost" style="margin-top:8px;font-size:12px;" onclick="applyRetention()">Apply retention</button>
+      <p class="dim" style="font-size:11px;margin:6px 0 0;">Age-based, independent of disk pressure. Both keep the transcript + chat forever.</p>
+    </details>
     <pre id="evict-out" style="display:none;background:#111;border:1px solid #2a2a2a;border-radius:6px;padding:10px;margin-top:10px;font-size:12px;max-height:220px;overflow:auto;white-space:pre-wrap;"></pre>
     <div class="btn-row">
       <button class="cancel" onclick="closeModal('modal-evict')">Cancel</button>

@@ -33,6 +33,7 @@ import os
 import glob
 import signal
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -132,6 +133,13 @@ class Settings:
     archive_transfers: int = max(1, int(os.environ.get("ARCHIVE_TRANSFERS", "4")))
     archive_bwlimit: str   = os.environ.get("ARCHIVE_BWLIMIT", "").strip()
     archive_retry_backoff_sec: int = int(os.environ.get("ARCHIVE_RETRY_BACKOFF", "120"))
+    # Age-based lifecycle (0 = off). Both keep the transcript + chat forever.
+    #   EVICT: after N days, drop the LOCAL .mp4 of an archived recording (it stays
+    #          on the cloud) regardless of disk pressure — proactive cold storage.
+    #   PURGE: after M days, also delete the CLOUD copy (rclone delete) and any
+    #          local .mp4 — removes the video entirely, keeping txt + chat.
+    retention_evict_days: float = float(os.environ.get("RETENTION_EVICT_DAYS", "0") or 0)
+    retention_purge_days: float = float(os.environ.get("RETENTION_PURGE_DAYS", "0") or 0)
 
 
 settings = Settings()
@@ -766,6 +774,64 @@ class TranscriptionWorker:
                 self._archive_with_backoff(mp4, now)
         # Keep hot / evict cold under disk pressure.
         self._evict_if_pressured()
+        # Age-based lifecycle (proactive evict / purge), independent of pressure.
+        self._retention_sweep()
+
+    def _retention_sweep(self) -> None:
+        """Age-based lifecycle, keyed on the .archived marker (so it covers evicted
+        cloud-only files too). Both keep the transcript + chat:
+          • evict: after retention_evict_days, drop the local .mp4 (stays on cloud).
+          • purge: after retention_purge_days, delete the cloud copy + local .mp4."""
+        if not settings.archive_remote:
+            return
+        ev_days, pg_days = settings.retention_evict_days, settings.retention_purge_days
+        if not ev_days and not pg_days:
+            return
+        now = time.time()
+        for marker in settings.watch_dir.rglob("*.archived"):
+            mp4 = marker.with_suffix(".mp4")
+            try:
+                age_d = (now - marker.stat().st_mtime) / 86400.0
+            except OSError:
+                continue
+            if pg_days and age_d >= pg_days:
+                self._purge_recording(mp4, marker, age_d)
+            elif ev_days and age_d >= ev_days and mp4.exists():
+                if self._remote_has(mp4):
+                    try:
+                        mp4.unlink()
+                        log.info("retention: evicted local %s (age %.1fd, on cloud)",
+                                 mp4.name, age_d)
+                    except OSError as e:
+                        log.warning("retention: could not evict %s: %s", mp4.name, e)
+
+    def _purge_recording(self, mp4: Path, marker: Path, age_d: float) -> None:
+        """Delete the cloud copy + any local .mp4 for an old recording, keeping the
+        transcript and chat. Only drops local once the cloud delete succeeds (so we
+        never lose the last copy on an rclone hiccup)."""
+        username = mp4.parent.name
+        remote = f"{settings.archive_remote.rstrip('/')}/{username}/{mp4.name}"
+        try:
+            subprocess.run(["rclone", "deletefile", remote],
+                           timeout=120, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log.warning("retention purge: rclone deletefile failed for %s: %s", mp4.name, e)
+            return
+        try:
+            if mp4.exists():
+                mp4.unlink()
+        except OSError:
+            pass
+        try:                       # mark purged so it isn't re-processed; keep txt/chat
+            marker.rename(marker.with_suffix(".purged"))
+        except OSError:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        log.info("retention: purged video %s (cloud+local, age %.1fd) — kept transcript/chat",
+                 mp4.name, age_d)
 
     def _record_failure(self, mp4: Path, fname: str, rc, final: dict,
                         attempt: int, err_path=None):
@@ -1060,6 +1126,8 @@ class TranscriptionWorker:
             "archive_evict_high_pct": settings.archive_evict_high_pct if settings.archive_remote else None,
             "archive_evict_low_pct": settings.archive_evict_low_pct if settings.archive_remote else None,
             "archive_evict_min_age_sec": settings.archive_evict_min_age_sec if settings.archive_remote else None,
+            "retention_evict_days": settings.retention_evict_days if settings.archive_remote else None,
+            "retention_purge_days": settings.retention_purge_days if settings.archive_remote else None,
             "last_evict":        self._last_evict or None,
         }
 
