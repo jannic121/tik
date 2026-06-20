@@ -717,9 +717,23 @@ def _ssh_connect(host: str, port: int, user: str, auth_method: str,
         emit(f"[ERROR] Connection failed: {type(e).__name__}: {e}\n"); return None
 
 
+def _ssh_run(client, cmd: str, timeout: int = 60):
+    """Run a command, return (exit_code, combined_output)."""
+    _, out, err = client.exec_command(cmd, timeout=timeout)
+    rc = out.channel.recv_exit_status()
+    text = out.read().decode("utf-8", errors="replace") + \
+           err.read().decode("utf-8", errors="replace")
+    return rc, text
+
+
 def _ssh_push_update(req: PushUpdateRequest, host: str, emit) -> None:
-    """SFTP the right files for the update type and restart the right services."""
-    import time as _time
+    """SFTP the right files for the update type and restart the right services.
+
+    Files are staged into a unique /tmp dir (avoids EACCES on stale files left
+    by a different SSH user) and then moved into place with sudo, so the deploy
+    works whether you log in as root or as a non-root user with passwordless
+    sudo — and it never depends on /opt being owned by the SSH user."""
+    import time as _time, secrets as _secrets
     plan = _UPDATE_PLAN[req.update_type]
     emit(f"==> Update type: {req.update_type}\n")
     emit(f"==> Will push {len(plan['files'])} file(s), restart: {', '.join(plan['services'])}\n\n")
@@ -727,23 +741,46 @@ def _ssh_push_update(req: PushUpdateRequest, host: str, emit) -> None:
                           req.auth_method, req.ssh_password, req.ssh_key_path, emit)
     if not client:
         return
+    sudo = "" if req.ssh_user == "root" else "sudo -n "
+    stage = f"/tmp/ttpush-{_secrets.token_hex(4)}"
     try:
         local_names = [f for f, _ in plan["files"]]
         missing = [f for f in local_names if not (settings.files_dir / f).exists()]
         if missing:
             emit(f"[ERROR] Missing local files: {missing}\n"); return
 
-        emit(f"==> Uploading {len(plan['files'])} file(s) ...\n")
+        rc, msg = _ssh_run(client, f"mkdir -p {stage}")
+        if rc != 0:
+            emit(f"[ERROR] Could not create staging dir {stage}: {msg.strip()}\n"); return
+
+        emit(f"==> Uploading {len(plan['files'])} file(s) → {stage} ...\n")
         sftp = client.open_sftp()
         try:
-            for fname, remote in plan["files"]:
-                emit(f"  {fname} → {remote} ... ")
-                sftp.put(str(settings.files_dir / fname), remote)
+            for fname, _remote in plan["files"]:
+                emit(f"  {fname} ... ")
+                sftp.put(str(settings.files_dir / fname), f"{stage}/{fname}")
                 emit("ok\n")
         finally:
             sftp.close()
 
-        sudo = "" if req.ssh_user == "root" else "sudo -n "
+        emit("\n==> Installing into place"
+             f"{' (sudo)' if sudo else ''} ...\n")
+        for fname, remote in plan["files"]:
+            emit(f"  {fname} → {remote} ... ")
+            rc, msg = _ssh_run(
+                client, f"{sudo}install -D -m 644 {stage}/{fname} {remote}")
+            if rc != 0:
+                emit(f"FAILED\n[ERROR] could not install {remote}: {msg.strip()}\n")
+                if not sudo:
+                    emit("       (root login but still denied — the file may be "
+                         "immutable: try `chattr -i` on the box, or check SELinux.)\n")
+                else:
+                    emit(f"       (non-root user '{req.ssh_user}' needs passwordless "
+                         f"sudo: echo '{req.ssh_user} ALL=(ALL) NOPASSWD: ALL' | "
+                         f"sudo tee /etc/sudoers.d/{req.ssh_user})\n")
+                return
+            emit("ok\n")
+
         for svc in plan["services"]:
             emit(f"\n==> Restarting {svc} ...\n")
             _, stdout, _ = client.exec_command(f"{sudo}systemctl restart {svc}", timeout=30)
@@ -776,6 +813,10 @@ def _ssh_push_update(req: PushUpdateRequest, host: str, emit) -> None:
     except Exception as e:
         emit(f"\n[ERROR] {type(e).__name__}: {e}\n")
     finally:
+        try:
+            _ssh_run(client, f"rm -rf {stage}", timeout=15)
+        except Exception:
+            pass
         client.close()
 
 
@@ -786,6 +827,7 @@ def _ssh_deploy(req: DeployRequest, emit) -> None:
     if not client:
         return
 
+    stage = None
     try:
         # Select file set, command, and args based on deploy type
         bind = "127.0.0.1" if req.host in ("127.0.0.1", "localhost") else "0.0.0.0"
@@ -807,14 +849,22 @@ def _ssh_deploy(req: DeployRequest, emit) -> None:
                  f"       Set DEPLOY_FILES_DIR or place them alongside control_plane.py\n")
             return
 
-        emit("==> Uploading files to /tmp on remote\n")
+        # Stage into a unique dir so a stale /tmp/provision.sh left by a
+        # different SSH user (owned by them, unwritable) can't cause EACCES.
+        import secrets as _secrets
+        stage = f"/tmp/ttdeploy-{_secrets.token_hex(4)}"
+        rc, msg = _ssh_run(client, f"mkdir -p {stage}")
+        if rc != 0:
+            emit(f"[ERROR] Could not create staging dir {stage}: {msg.strip()}\n")
+            return
+        emit(f"==> Uploading files to {stage} on remote\n")
         sftp = client.open_sftp()
         try:
             for fname in deploy_files:
                 emit(f"  - {fname} ... ")
-                sftp.put(str(settings.files_dir / fname), f"/tmp/{fname}")
+                sftp.put(str(settings.files_dir / fname), f"{stage}/{fname}")
                 if fname.endswith(".sh"):
-                    sftp.chmod(f"/tmp/{fname}", 0o755)
+                    sftp.chmod(f"{stage}/{fname}", 0o755)
                 emit("ok\n")
         finally:
             sftp.close()
@@ -831,7 +881,7 @@ def _ssh_deploy(req: DeployRequest, emit) -> None:
         else:
             sudo = ""
 
-        cmd = f"{sudo}bash /tmp/{script_name} {script_args}"
+        cmd = f"{sudo}bash {stage}/{script_name} {script_args}"
         emit(f"\n==> Running: {cmd}\n\n")
 
         _, stdout, stderr = client.exec_command(cmd, get_pty=True, timeout=600)
@@ -880,6 +930,11 @@ def _ssh_deploy(req: DeployRequest, emit) -> None:
     except Exception as e:
         emit(f"\n[ERROR] {type(e).__name__}: {e}\n")
     finally:
+        try:
+            if stage:
+                _ssh_run(client, f"rm -rf {stage}", timeout=15)
+        except Exception:
+            pass
         client.close()
 
 
