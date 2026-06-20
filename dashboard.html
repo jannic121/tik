@@ -376,12 +376,21 @@
 
 <!-- ========== Deploy ========== -->
 <section class="panel" id="panel-search">
-  <div class="panel-head"><h2>Transcript search</h2></div>
-  <div style="max-width:640px;margin-bottom:18px;">
+  <div class="panel-head"><h2>Search</h2></div>
+  <div style="max-width:760px;margin-bottom:18px;">
     <div style="display:flex;gap:8px;">
-      <input id="sq-input" placeholder="Search across all transcripts…"
+      <input id="sq-input" placeholder="Search transcripts and chat…"
              style="flex:1;" onkeydown="if(event.key==='Enter')doSearch()" />
       <button class="primary" onclick="doSearch()" style="min-width:80px;">Search</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap;">
+      <select id="sq-type" onchange="doSearch()" style="background:#161616;border:1px solid #2a2a2a;border-radius:5px;color:#ddd;padding:5px 9px;font-size:12px;">
+        <option value="all">Transcripts + chat</option>
+        <option value="transcript">Transcripts only</option>
+        <option value="chat">Chat only</option>
+      </select>
+      <input id="sq-creator" placeholder="Filter by creator…" oninput="_renderSearch()"
+             style="background:#161616;border:1px solid #2a2a2a;border-radius:5px;color:#ddd;padding:5px 9px;font-size:12px;width:180px;"/>
     </div>
     <p id="sq-meta" style="font-size:12px;color:#666;margin:6px 0 0;"></p>
     <p id="sq-index" style="font-size:11px;color:#666;margin:4px 0 0;"></p>

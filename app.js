@@ -1111,11 +1111,11 @@ async function deleteFile(bpk, path, storageSid) {
 async function loadSearchIndex() {
   const el = $('sq-index'); if (!el) return;
   try {
-    const r = await api('/api/transcript-index/status');
-    if (!r) return;
-    const d = await r.json();
-    if (!d.enabled) { el.innerHTML = '<span class="dim">Live search (catalog index off).</span>'; return; }
-    el.innerHTML = `Search index: <strong>${d.indexed}</strong> transcript${d.indexed===1?'':'s'} `
+    const [tr,cr] = await Promise.all([api('/api/transcript-index/status'), api('/api/chat-index/status')]);
+    const td = tr && tr.ok ? await tr.json() : {enabled:false};
+    const cd = cr && cr.ok ? await cr.json() : {enabled:false};
+    if (!td.enabled && !cd.enabled) { el.innerHTML = '<span class="dim">Live search (catalog index off).</span>'; return; }
+    el.innerHTML = `Indexed: <strong>${td.indexed||0}</strong> transcripts · <strong>${cd.indexed||0}</strong> chat logs `
       + `· <a href="#" onclick="reindexTranscripts(event)" style="color:#6ee7a7;">Reindex</a>`;
   } catch(_) {}
 }
@@ -1130,41 +1130,55 @@ async function reindexTranscripts(ev) {
   loadSearchIndex();
 }
 
+let _searchResults = [], _searchQuery = '';
 async function doSearch() {
   const q = $('sq-input').value.trim();
   if (!q) return;
+  _searchQuery = q;
+  const type = $('sq-type') ? $('sq-type').value : 'all';
   const meta = $('sq-meta'), el = $('search-content');
   meta.textContent = 'Searching…'; el.innerHTML = '';
 
-  const r = await api(`/api/transcript-search?q=${encodeURIComponent(q)}`);
-  if (!r) { meta.textContent = ''; return; }
-  const results = await r.json();
+  const calls = [];
+  if (type !== 'chat') calls.push(api(`/api/transcript-search?q=${encodeURIComponent(q)}`).then(r=>r&&r.ok?r.json():[]).then(a=>a.map(x=>({...x,_kind:'transcript'}))));
+  if (type !== 'transcript') calls.push(api(`/api/chat/search?q=${encodeURIComponent(q)}`).then(r=>r&&r.ok?r.json():[]).then(a=>a.map(x=>({...x,_kind:'chat'}))));
+  let all = [];
+  try { (await Promise.all(calls)).forEach(a=>all=all.concat(a)); } catch(_){}
+  all.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
+  _searchResults = all;
+  _renderSearch();
+}
 
-  if (!results.length) {
+function _renderSearch() {
+  const el = $('search-content'), meta = $('sq-meta');
+  if (!_searchResults) return;
+  const cf = ($('sq-creator')?.value||'').trim().toLowerCase();
+  const rows = cf ? _searchResults.filter(r=>(r.username||'').toLowerCase().includes(cf)) : _searchResults;
+  if (!rows.length) {
     meta.textContent = '';
-    el.innerHTML = `<div class="empty">No transcripts match <strong>${esc(q)}</strong>.</div>`;
+    el.innerHTML = `<div class="empty">No results match <strong>${esc(_searchQuery)}</strong>${cf?` for creator “${esc(cf)}”`:''}.</div>`;
     return;
   }
-
-  meta.textContent = `${results.length} result${results.length===1?'':'s'} for "${q}"`;
-
-  // Highlight the query term in snippets
-  const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + ')', 'gi');
+  meta.textContent = `${rows.length} result${rows.length===1?'':'s'} for "${_searchQuery}"`;
+  const re = new RegExp('(' + _searchQuery.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + ')', 'gi');
   el.innerHTML = `<table>
-    <thead><tr><th>Creator</th><th>File</th><th>Match</th><th>Server</th><th></th></tr></thead>
-    <tbody>${results.map(r => {
-      const snippet = esc(r.snippet).replace(re, '<mark style="background:#4a3800;color:#fc6;border-radius:2px;padding:0 2px;">$1</mark>');
+    <thead><tr><th>Type</th><th>Creator</th><th>File</th><th>Match</th><th></th></tr></thead>
+    <tbody>${rows.map(r => {
+      const isChat = r._kind==='chat';
+      const recFile = isChat ? (r.recording_filename||null) : r.filename;
+      const snippet = esc(r.snippet||'').replace(re, '<mark style="background:#4a3800;color:#fc6;border-radius:2px;padding:0 2px;">$1</mark>');
+      const tag = isChat ? '<span style="color:#c9f;">💬 chat</span>' : '<span style="color:#6ee7a7;">📝 transcript</span>';
+      const viewBtn = isChat
+        ? `<button onclick='openChatLog(${JSON.stringify(r.filename)},${JSON.stringify(r.username)})' style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;">Open log</button>`
+        : `<button onclick="viewTranscript(${JSON.stringify(r.filename)})" style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;">View</button>`;
+      const fileBtn = recFile ? `<button onclick="gotoFile(${JSON.stringify(recFile)})" title="Show in Files tab"
+              style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;margin-left:2px;">→ File</button>` : '';
       return `<tr>
+        <td style="font-size:11px;white-space:nowrap;">${tag}</td>
         <td><strong>${esc(r.username)}</strong></td>
         <td class="mono dim" style="font-size:11px;">${esc(r.filename)}</td>
-        <td style="max-width:480px;font-size:12px;line-height:1.5;color:#c0c0c0;">${snippet}</td>
-        <td class="dim" style="font-size:11px;">${esc(r.storage_label||'—')}</td>
-        <td style="white-space:nowrap;"><button onclick="viewTranscript(${JSON.stringify(r.filename)})"
-              style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;
-                     border-radius:3px;font-size:11px;cursor:pointer;">View</button>
-          <button onclick="gotoFile(${JSON.stringify(r.filename)})" title="Show this recording in the Files tab"
-              style="background:#1a2a3a;color:#9cf;border:1px solid #2a4a6a;padding:3px 8px;
-                     border-radius:3px;font-size:11px;cursor:pointer;margin-left:2px;">→ File</button></td>
+        <td style="max-width:440px;font-size:12px;line-height:1.5;color:#c0c0c0;">${snippet}</td>
+        <td style="white-space:nowrap;">${viewBtn}${fileBtn}</td>
       </tr>`;}).join('')}</tbody></table>`;
 }
 
