@@ -163,6 +163,7 @@
   </div>
   <div id="storage-breakdown" style="display:none;margin-bottom:16px;"></div>
   <div id="moves-panel" style="display:none;margin-bottom:16px;"></div>
+  <div id="storage-capacity" style="margin-bottom:16px;"></div>
   <div id="storage-content"></div>
 
   <div class="modal-bg" id="modal-move">
@@ -331,6 +332,11 @@
       <button class="ghost" onclick="runUploadNow()" title="Scan all backends and transfer any pending files now">↑ Upload now</button>
       <button class="ghost" onclick="loadFiles()">Refresh</button>
     </div>
+  </div>
+  <div id="files-bulk" style="display:none;align-items:center;gap:12px;background:#23201a;border:1px solid #4a3a1a;border-radius:6px;padding:8px 12px;margin-bottom:10px;">
+    <span id="files-bulk-count" style="font-size:13px;color:#fc6;"></span>
+    <button class="danger" onclick="bulkDelete()">Delete selected</button>
+    <button class="ghost" style="font-size:12px;" onclick="clearFileSel()">Clear</button>
   </div>
   <div id="files-content"></div>
 </section>

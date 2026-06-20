@@ -42,7 +42,35 @@ function switchTab(name) {
 }
 
 // Servers tab = recorders + storage/transcription together.
-async function loadServers() { await Promise.all([loadBackends(), loadStorage()]); }
+async function loadServers() { await Promise.all([loadBackends(), loadStorage(), loadCapacity()]); }
+
+// Disk capacity + "time to full" projection per storage server.
+async function loadCapacity() {
+  const el = $('storage-capacity'); if (!el) return;
+  let servers = [];
+  try { const r = await api('/api/storage-capacity'); if (r && r.ok) servers = (await r.json()).servers || []; } catch(_) {}
+  if (!servers.length) { el.innerHTML = ''; return; }
+  const eta = h => h==null ? '<span class="dim">—</span>'
+      : (h < 48 ? `<span style="color:#f99;">~${h<1?Math.round(h*60)+' min':h.toFixed(1)+' h'}</span>`
+                : `~${(h/24).toFixed(1)} days`);
+  el.innerHTML = `<div style="font-size:12px;color:#aaa;margin:0 0 6px;text-transform:uppercase;letter-spacing:.04em;">Disk capacity</div>
+    <table><thead><tr><th>Storage</th><th>Used</th><th>Free</th><th>Trend</th><th>Time to full</th></tr></thead>
+    <tbody>${servers.map(s=>{
+      const pct = s.used_pct; const col = pct==null?'#888':(pct>=90?'#f99':pct>=75?'#fc6':'#6ee7a7');
+      const bar = pct==null ? '' : `<div style="display:inline-block;vertical-align:middle;width:120px;height:8px;background:#2a2a2a;border-radius:4px;overflow:hidden;margin-right:8px;">
+        <div style="height:100%;width:${pct}%;background:${col};"></div></div>`;
+      const trend = s.fill_rate_bph==null ? '<span class="dim">measuring…</span>'
+        : (s.fill_rate_bph > 0 ? `↓ ${fmtBytes(s.fill_rate_bph)}/h`
+          : s.fill_rate_bph < 0 ? `<span style="color:#6ee7a7;">↑ freeing ${fmtBytes(-s.fill_rate_bph)}/h</span>`
+          : '<span class="dim">steady</span>');
+      return `<tr>
+        <td><strong>${esc(s.label)}</strong>${s.healthy?'':' <span class="dim">(offline)</span>'}</td>
+        <td>${bar}<span style="color:${col};">${pct==null?'—':pct+'%'}</span></td>
+        <td>${s.free!=null?fmtBytes(s.free):'—'}${s.total?` / ${fmtBytes(s.total)}`:''}</td>
+        <td style="font-size:12px;">${trend}</td>
+        <td style="font-size:12px;">${s.fill_rate_bph>0?eta(s.hours_to_full):'<span class="dim">not filling</span>'}</td>
+      </tr>`;}).join('')}</tbody></table>`;
+}
 
 async function logout() {
   await api('/api/logout',{method:'POST'});
@@ -455,7 +483,7 @@ async function deleteWatcher(username) {
 }
 
 // ── Files ─────────────────────────────────────────────────────────
-let _filesCache=null, _highlightFile=null;
+let _filesCache=null, _highlightFile=null, _selectedFiles=new Map();
 
 async function loadFiles() {
   const r=await api('/api/files'); if(!r) return;
@@ -521,7 +549,7 @@ function renderFiles(){
   if(!items.length){el.innerHTML=`<div class="empty">No files match <strong>${esc(q)}</strong>.</div>`;return;}
 
   el.innerHTML=`<table>
-    <thead><tr><th>Username</th><th>Backend</th><th>File</th><th>Size</th><th>Modified</th><th>Storage</th><th>Transcript</th><th></th></tr></thead>
+    <thead><tr><th style="width:28px;"><input type="checkbox" onclick="toggleAllFiles(this)" title="select all"/></th><th>Username</th><th>Backend</th><th>File</th><th>Size</th><th>Modified</th><th>Storage</th><th>Transcript</th><th></th></tr></thead>
     <tbody>${items.map(f=>{
       const fname=f.path.split('/').pop();
       const dlUrl = f.backend_pk
@@ -569,6 +597,7 @@ function renderFiles(){
         const cdl = `/api/files/cloud-download?username=${encodeURIComponent(f.username)}&filename=${encodeURIComponent(fname)}`
                   + (f.storage_sid?`&storage_sid=${encodeURIComponent(f.storage_sid)}`:'');
         return `<tr data-fname="${esc(fname)}">
+          <td></td>
           <td><strong>${esc(f.username)}</strong></td>
           <td><span style="color:#c9f;font-size:11px;">☁ cloud only</span></td>
           <td class="mono dim" style="font-size:11px;">${esc(fname)}</td>
@@ -584,6 +613,7 @@ function renderFiles(){
       const cloudBadge = (arch[fname] && arch[fname].on_cloud)
         ? ` <span title="also archived on the cloud" style="color:#c9f;font-size:10px;">☁</span>` : '';
       return `<tr data-fname="${esc(fname)}">
+        <td><input type="checkbox" class="file-cb" data-fname="${esc(fname)}" data-bpk="${f.backend_pk||''}" data-sid="${f.storage_sid||''}" data-path="${esc(f.path)}" onchange="toggleFileSel(this)"/></td>
         <td><strong>${esc(f.username)}</strong></td>
         <td class="dim">${f.backend_pk ? esc(f.backend_label) : '<span style="color:#6ee7a7;font-size:11px;">on storage</span>'}</td>
         <td class="mono dim" style="font-size:11px;">${esc(fname)}${cloudBadge}</td>
@@ -609,6 +639,48 @@ function renderFiles(){
       }
     });
   }
+
+  // Restore selection across re-renders (the Files tab auto-refreshes every 5s).
+  el.querySelectorAll('input.file-cb').forEach(cb=>{
+    if(_selectedFiles.has(cb.dataset.fname)) cb.checked=true;
+  });
+  updateBulkBar();
+}
+
+// ── Bulk file operations ─────────────────────────────────────────
+function toggleFileSel(cb){
+  if(cb.checked) _selectedFiles.set(cb.dataset.fname,
+    {bpk:cb.dataset.bpk||null, sid:cb.dataset.sid||null, path:cb.dataset.path});
+  else _selectedFiles.delete(cb.dataset.fname);
+  updateBulkBar();
+}
+function toggleAllFiles(master){
+  document.querySelectorAll('input.file-cb').forEach(cb=>{ cb.checked=master.checked; toggleFileSel(cb); });
+}
+function clearFileSel(){
+  _selectedFiles.clear();
+  document.querySelectorAll('input.file-cb').forEach(cb=>cb.checked=false);
+  updateBulkBar();
+}
+function updateBulkBar(){
+  const bar=$('files-bulk'), n=_selectedFiles.size;
+  if(!bar) return;
+  bar.style.display = n ? 'flex' : 'none';
+  const c=$('files-bulk-count'); if(c) c.textContent = `${n} file${n===1?'':'s'} selected`;
+}
+async function bulkDelete(){
+  const items=[..._selectedFiles.values()];
+  if(!items.length) return;
+  if(!confirm(`Delete ${items.length} file(s) permanently?\nThis may be the only remaining copy of some.`)) return;
+  let ok=0, fail=0;
+  for(const it of items){
+    const body = it.sid ? {storage_sid:it.sid, path:it.path} : {backend_pk:it.bpk, path:it.path};
+    try { const r=await api('/api/files/delete',{method:'POST',body:JSON.stringify(body)});
+      if(r && r.status===204) ok++; else fail++; } catch(_){ fail++; }
+  }
+  _selectedFiles.clear();
+  alert(`Deleted ${ok} file(s)` + (fail?`, ${fail} failed`:''));
+  loadFiles();
 }
 
 

@@ -248,6 +248,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _add_col("backends", "ssh_port", "INTEGER")
     _add_col("storage_servers", "ssh_host", "TEXT")
     _add_col("storage_servers", "ssh_port", "INTEGER")
+    # Disk-usage history per storage server, for the capacity / time-to-full view.
+    conn.execute("""CREATE TABLE IF NOT EXISTS disk_samples (
+        storage_id TEXT NOT NULL, ts REAL NOT NULL,
+        free_bytes INTEGER, total_bytes INTEGER)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_disk_samples ON disk_samples(storage_id, ts)")
     conn.commit()
 
 
@@ -1314,6 +1319,17 @@ async def _health_loop() -> None:
                          info.get("beam_size"),
                          time.time(), s["id"]),
                     )
+                    # Disk-usage history (throttled to ~5 min/server, pruned to 14 days)
+                    free, total = info.get("disk_free_bytes"), info.get("disk_total_bytes")
+                    if free is not None and total:
+                        last = db.execute(
+                            "SELECT MAX(ts) AS t FROM disk_samples WHERE storage_id=?",
+                            (s["id"],)).fetchone()
+                        if not last["t"] or (time.time() - last["t"]) >= 300:
+                            db.execute("INSERT INTO disk_samples(storage_id,ts,free_bytes,total_bytes)"
+                                       " VALUES(?,?,?,?)", (s["id"], time.time(), free, total))
+                            db.execute("DELETE FROM disk_samples WHERE storage_id=? AND ts < ?",
+                                       (s["id"], time.time() - 14*86400))
                     db.commit()
         except Exception:
             log.exception("health loop error")
@@ -3472,6 +3488,39 @@ async def storage_archive_test(sid: str, req: dict):
         host, req.get("ssh_port", 22), req.get("ssh_user", "root"),
         req.get("auth_method", "key"), req.get("ssh_password"), req.get("ssh_key_path"))
     return _threaded_stream(lambda emit: _ssh_archive_test(host, req, emit))
+
+
+@app.get("/api/storage-capacity", dependencies=[Depends(require_login)])
+async def storage_capacity():
+    """Per-storage disk usage + fill-rate projection (time to full), from the
+    sampled history. fill_rate_bph > 0 means free space is shrinking."""
+    out = []
+    now = time.time()
+    for s in _storage_all():
+        async with _db_lock:
+            rows = db.execute(
+                "SELECT ts, free_bytes, total_bytes FROM disk_samples "
+                "WHERE storage_id=? ORDER BY ts DESC LIMIT 4032", (s["id"],)).fetchall()
+        e = {"id": s["id"], "label": s["label"] or s["url"],
+             "healthy": bool(s["last_health_ok"]), "free": None, "total": None,
+             "used_pct": None, "fill_rate_bph": None, "hours_to_full": None,
+             "samples": len(rows)}
+        if rows:
+            newest = rows[0]
+            e["free"], e["total"] = newest["free_bytes"], newest["total_bytes"]
+            if newest["total_bytes"]:
+                e["used_pct"] = round(100 * (1 - newest["free_bytes"] / newest["total_bytes"]), 1)
+            # fill rate from the oldest sample within the last 12h (or the oldest we have)
+            window_start = now - 12 * 3600
+            ref = next((r for r in rows if r["ts"] <= window_start), rows[-1])
+            dt_h = (newest["ts"] - ref["ts"]) / 3600.0
+            if dt_h > 0.05:
+                rate = (ref["free_bytes"] - newest["free_bytes"]) / dt_h   # bytes/hr lost
+                e["fill_rate_bph"] = round(rate)
+                if rate > 0 and newest["free_bytes"] is not None:
+                    e["hours_to_full"] = round(newest["free_bytes"] / rate, 1)
+        out.append(e)
+    return {"servers": out}
 
 
 @app.get("/api/archive-statuses", dependencies=[Depends(require_login)])
