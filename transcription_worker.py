@@ -216,6 +216,50 @@ def _extract_audio_tolerant(src: Path) -> Optional[Path]:
     return None
 
 
+def _rebuild_truncated(src: Path) -> Optional[Path]:
+    """Last resort for a recording missing/with-broken moov that ffmpeg can't even
+    open: if `untrunc` is installed, rebuild it using a known-good recording from
+    the same recorder as the structural reference. Returns the rebuilt mp4 (in a
+    temp dir) or None. Gated entirely on the binary being present, so it's a no-op
+    until you install untrunc (see provision_storage.sh)."""
+    import tempfile as _tf
+    untrunc = os.environ.get("UNTRUNC_BIN", "untrunc")
+    if not shutil.which(untrunc):
+        return None
+    # Reference: the most recent OTHER recording that transcribed fine (= decodable,
+    # so same codec/params from this recorder).
+    cands = [p for p in settings.watch_dir.rglob("*.mp4")
+             if p != src and not p.name.endswith("_flv.mp4") and p.with_suffix(".txt").exists()]
+    if not cands:
+        return None
+    ref = max(cands, key=lambda p: p.stat().st_mtime)
+    d = Path(_tf.mkdtemp(prefix="tw-untrunc-"))
+    link = d / src.name                      # symlink avoids copying a multi-GB file
+    try:
+        os.symlink(src.resolve(), link)
+    except OSError:
+        try: d.rmdir()
+        except OSError: pass
+        return None
+    print(f"[salvage] untrunc rebuild of {src.name} using reference {ref.name}", flush=True)
+    try:
+        subprocess.run([untrunc, str(ref), str(link)], timeout=1800,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[salvage] untrunc failed: {e}", flush=True)
+    fixed = link.with_name(link.stem + "_fixed.mp4")   # untrunc's output naming
+    if fixed.exists() and fixed.stat().st_size > 1024:
+        return fixed
+    try:
+        link.unlink(missing_ok=True)
+        if fixed.exists():
+            fixed.unlink()
+        d.rmdir()
+    except OSError:
+        pass
+    return None
+
+
 def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
     """Run as a child process: `transcription_worker.py --transcribe-one <mp4> [--safe]`.
     Loads the model, transcribes incrementally, writes progress to <mp4>.progress
@@ -240,6 +284,7 @@ def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
             pass
 
     wav = None
+    rebuilt = None
     try:
         write_progress(pct=0.0, processed_sec=0.0, duration=None, done=False)
         from faster_whisper import WhisperModel
@@ -286,17 +331,33 @@ def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
                   f"salvaging audio via ffmpeg…", flush=True)
             wav = _extract_audio_tolerant(mp4)
             if not wav:
+                # ffmpeg couldn't even open it — try an untrunc moov rebuild, then
+                # salvage audio from the rebuilt file.
+                rebuilt = _rebuild_truncated(mp4)
+                if rebuilt:
+                    wav = _extract_audio_tolerant(rebuilt)
+            if not wav:
                 raise RuntimeError(f"unsalvageable ({e})")
             segments, info, duration = _decode(wav)
 
+        salvaged = bool(wav)
         txt = mp4.with_suffix(".txt")
         header = (f"# language={info.language} duration={duration}s "
-                  f"model={settings.model}{' salvaged' if wav else ''}\n\n")
+                  f"model={settings.model}{' salvaged' if salvaged else ''}\n\n")
         txt.write_text(header + _segments_to_txt(segments), encoding="utf-8")
+        # Leave a marker so the UI can flag recovered (partial) transcripts; clear
+        # a stale one if a clean re-transcription later succeeds.
+        try:
+            if salvaged:
+                mp4.with_suffix(".salvaged").write_text(str(round(time.time())))
+            else:
+                mp4.with_suffix(".salvaged").unlink(missing_ok=True)
+        except OSError:
+            pass
         write_progress(pct=1.0, processed_sec=duration or 0.0, duration=duration,
                        language=info.language, segments=len(segments),
                        words=sum(len(s.words or []) for s in segments),
-                       done=True, salvaged=bool(wav))
+                       done=True, salvaged=salvaged)
         return 0
     except Exception as e:
         write_progress(done=True, error=str(e)[:500])
@@ -304,12 +365,13 @@ def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
         _tb.print_exc()
         return 1
     finally:
-        if wav is not None:
-            try:
-                wav.unlink(missing_ok=True)
-                wav.parent.rmdir()
-            except OSError:
-                pass
+        for tmp in (wav, rebuilt):
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                    tmp.parent.rmdir()
+                except OSError:
+                    pass
 
 
 def _segments_to_txt(segments: list) -> str:
@@ -1659,6 +1721,15 @@ async def all_statuses():
     """Return {filename: 'done'|'processing'|'pending'} for all known MP4s.
     Missing keys mean 'none'. Used by the control plane to populate the Files tab."""
     return worker.all_statuses()
+
+
+@app.get("/transcripts/salvaged", dependencies=[Depends(require_auth)])
+async def salvaged_list():
+    """MP4 filenames whose transcript was recovered from a corrupt/truncated
+    recording (ffmpeg salvage / untrunc rebuild) — i.e. likely partial."""
+    if not settings.watch_dir.exists():
+        return []
+    return [m.with_suffix(".mp4").name for m in settings.watch_dir.rglob("*.salvaged")]
 
 
 @app.get("/transcripts/view", dependencies=[Depends(require_auth)],

@@ -2568,6 +2568,19 @@ async def delete_file(body: DeleteFileBody):
 # ---------------------------------------------------------------------------
 # Transcript worker proxy
 
+@app.get("/api/salvaged-statuses", dependencies=[Depends(require_login)])
+async def salvaged_statuses():
+    """{filename: true} for transcripts recovered from corrupt recordings (partial),
+    merged across storage servers."""
+    out: dict = {}
+    for s in _storage_healthy():
+        code, body = await _tw_call(s, "GET", "/transcripts/salvaged")
+        if code == 200 and isinstance(body, list):
+            for fn in body:
+                out[fn] = True
+    return out
+
+
 @app.get("/api/transcript-statuses", dependencies=[Depends(require_login)])
 async def transcript_statuses():
     """{filename: status}. Served from the catalog (fast, works when a node is down)

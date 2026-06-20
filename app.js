@@ -490,15 +490,16 @@ async function loadFiles() {
   const data=await r.json();
 
   // Statuses + locations + chat matches + cloud-archive status (incl. evicted files)
-  let ts={}, xfr={}, prog={}, locs={}, chatm={}, arch={};
+  let ts={}, xfr={}, prog={}, locs={}, chatm={}, arch={}, salv={};
   try {
-    const [tr,tx,tp,tl,cm,ar]=await Promise.all([
+    const [tr,tx,tp,tl,cm,ar,sv]=await Promise.all([
       api('/api/transcript-statuses'),
       api('/api/transfer-statuses'),
       api('/api/transfer-progress'),
       api('/api/file-locations'),
       api('/api/chat-matches'),
       api('/api/archive-statuses'),
+      api('/api/salvaged-statuses'),
     ]);
     if(tr&&tr.ok) ts=await tr.json();
     if(tx&&tx.ok) xfr=await tx.json();
@@ -506,9 +507,10 @@ async function loadFiles() {
     if(tl&&tl.ok) locs=await tl.json();
     if(cm&&cm.ok) chatm=await cm.json();
     if(ar&&ar.ok) arch=await ar.json();
+    if(sv&&sv.ok) salv=await sv.json();
   } catch(_){}
 
-  _filesCache={data,ts,xfr,prog,locs,chatm,arch};
+  _filesCache={data,ts,xfr,prog,locs,chatm,arch,salv};
   renderFiles();
 }
 
@@ -520,10 +522,11 @@ function gotoFile(filename){
   switchTab('files');   // triggers loadFiles(), which honours the filter + highlight
 }
 
-function _tsCell(fname, tst){
+function _tsCell(fname, tst, salvaged){
   if(tst==='processing') return '<span style="background:#3a3a1a;color:#fc6;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Transcribing…</span>';
   if(tst==='pending') return '<span style="background:#2a2a2a;color:#888;font-size:11px;padding:2px 8px;border-radius:3px;">⏳ Pending</span>';
-  if(tst==='done') return `<span style="background:#1a2e1a;color:#6ee7a7;font-size:11px;padding:2px 8px;border-radius:3px;">✓ Available</span>
+  if(tst==='done') return `<span style="background:#1a2e1a;color:#6ee7a7;font-size:11px;padding:2px 8px;border-radius:3px;">✓ Available</span>`
+      + (salvaged?` <span title="recovered from a corrupt/interrupted recording — may be partial" style="background:#3a2a1a;color:#fc6;font-size:11px;padding:2px 6px;border-radius:3px;">⚠ salvaged</span>`:'') + `
       <button onclick="viewTranscript(${JSON.stringify(fname)})"
         style="background:#1f3a2a;color:#6ee7a7;border:1px solid #2d5a3f;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;margin-left:4px;">View</button>
       <a href="/api/transcript-download?filename=${encodeURIComponent(fname)}"
@@ -534,7 +537,7 @@ function _tsCell(fname, tst){
 
 function renderFiles(){
   if(!_filesCache) return;
-  const {data,ts,xfr,prog,locs,chatm={},arch={}}=_filesCache;
+  const {data,ts,xfr,prog,locs,chatm={},arch={},salv={}}=_filesCache;
   const el=$('files-content');
   // Merge in evicted (cloud-only) recordings: archived, no local copy, not already listed.
   const localNames = new Set(data.map(f=>(f.path||'').split('/').pop()));
@@ -588,7 +591,7 @@ function renderFiles(){
                         border-radius:3px;font-size:11px;cursor:pointer;margin-left:4px;">Retry</button>`;
       }
 
-      const tsCell=_tsCell(fname, ts[fname]||'none');
+      const tsCell=_tsCell(fname, ts[fname]||'none', salv[fname]);
       const chatBtn = chatm[fname] ? `<button onclick='openChatLog(${JSON.stringify(chatm[fname])},${JSON.stringify(f.username)})' title="open the matched chat log"
              style="background:#2a1f3a;color:#c9f;border:1px solid #4a3a6a;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;">💬 chat</button>` : '';
 

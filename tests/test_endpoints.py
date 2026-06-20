@@ -70,6 +70,7 @@ def test_core_get_endpoints_ok():
         "/api/transfer-statuses", "/api/transfer-progress",
         "/api/transcript-statuses", "/api/file-locations",
         "/api/chat-matches", "/api/archive-statuses", "/api/archive/overview",
+        "/api/salvaged-statuses",
         "/api/storage-capacity", "/api/update-status",
         "/api/alerts/config",
         "/api/transcript-index/status", "/api/chat-index/status",
