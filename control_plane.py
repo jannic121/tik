@@ -2345,10 +2345,13 @@ async def file_locations():
 
 @app.get("/api/files/download")
 async def download_file(path: str, backend_pk: Optional[str] = None,
-                        storage_sid: Optional[str] = None,
+                        storage_sid: Optional[str] = None, inline: int = 0,
+                        request: Request = None,
                         session: Optional[str] = Cookie(default=None)):
     """Proxy a file to the browser from either a recorder (backend_pk) or a
-    storage server (storage_sid). Cookie check so a plain <a href> works."""
+    storage server (storage_sid). Cookie check so a plain <a href> works.
+    Forwards Range so an in-browser <video> can seek; `inline=1` serves it for
+    playback rather than as a download."""
     if not _verify_session(session):
         raise HTTPException(401, "login required")
 
@@ -2369,24 +2372,31 @@ async def download_file(path: str, backend_pk: Optional[str] = None,
         src_token = row["auth_token"]
 
     filename = Path(path).name
+    up_headers = {"Authorization": f"Bearer {src_token}"}
+    rng = request.headers.get("range") if request else None
+    if rng:
+        up_headers["Range"] = rng
+
+    client = httpx.AsyncClient(timeout=None)
+    req = client.build_request("GET", src_url, headers=up_headers, params={"path": path})
+    r = await client.send(req, stream=True)
+    disp = "inline" if inline else "attachment"
+    resp_headers = {"Accept-Ranges": "bytes",
+                    "Content-Disposition": f'{disp}; filename="{filename}"'}
+    for h in ("content-range", "content-length"):
+        if h in r.headers:
+            resp_headers[h.title()] = r.headers[h]
 
     async def _stream():
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "GET", src_url,
-                headers={"Authorization": f"Bearer {src_token}"},
-                params={"path": path},
-            ) as r:
-                if r.status_code != 200:
-                    return
-                async for chunk in r.aiter_bytes(chunk_size=65536):
-                    yield chunk
+        try:
+            async for chunk in r.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
 
-    return StreamingResponse(
-        _stream(),
-        media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return StreamingResponse(_stream(), status_code=r.status_code,
+                             media_type="video/mp4", headers=resp_headers)
 
 
 @app.post("/api/files/delete", status_code=204, dependencies=[Depends(require_login)])

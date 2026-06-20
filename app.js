@@ -622,6 +622,8 @@ function renderFiles(){
         <td style="white-space:nowrap;">${xCell}</td>
         <td style="white-space:nowrap;">${tsCell}</td>
         <td style="display:flex;gap:4px;align-items:center;white-space:nowrap;">
+          <button onclick='openPlayer(${JSON.stringify(fname)},${JSON.stringify(f.username)},${JSON.stringify(dlUrl)},${ts[fname]==='done'},${chatm[fname]?JSON.stringify(chatm[fname]):'null'})'
+             style="background:#1f2a3a;color:#9cf;border:1px solid #2a4a6a;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;" title="play in browser with synced transcript + chat">▶ Play</button>
           <a href="${dlUrl}" download="${esc(fname)}"
              style="background:#2a3a4a;color:#9cf;border:1px solid #3a5a7a;padding:4px 8px;
                     border-radius:4px;font-size:12px;text-decoration:none;">↓ MP4</a>${chatBtn}
@@ -645,6 +647,55 @@ function renderFiles(){
     if(_selectedFiles.has(cb.dataset.fname)) cb.checked=true;
   });
   updateBulkBar();
+}
+
+// ── In-browser playback with synced transcript + chat timeline ───
+let _playerItems = [];
+async function openPlayer(fname, username, dlUrl, hasTranscript, chatFile){
+  $('player-title').textContent = `${username} — ${fname}`;
+  const v=$('player-video');
+  v.src = dlUrl + (dlUrl.includes('?')?'&':'?') + 'inline=1';
+  const tl=$('player-timeline'); tl.innerHTML='<div class="dim">Loading timeline…</div>';
+  openModal('modal-player');
+  const items=[];
+  if(hasTranscript){
+    try{ const r=await api('/api/transcript-view?filename='+encodeURIComponent(fname));
+      if(r&&r.ok){ (await r.text()).split('\n').forEach(line=>{
+        const m=line.match(/\[(\d{1,2}):(\d{2}):(\d{2})\]\s*(.*)/);
+        if(m && m[4].trim()) items.push({sec:(+m[1])*3600+(+m[2])*60+(+m[3]), type:'t', text:m[4]}); }); }
+    }catch(_){}
+  }
+  if(chatFile){
+    try{ const r=await api('/api/chat/view?filename='+encodeURIComponent(chatFile));
+      if(r&&r.ok){ (await r.json()).events?.forEach(ev=>{
+        if(ev.rel!=null && (ev.type==='comment'||ev.type==='gift')) items.push({sec:ev.rel, type:'c', ev}); }); }
+    }catch(_){}
+  }
+  items.sort((a,b)=>a.sec-b.sec);
+  _playerItems = items;
+  if(!items.length){ tl.innerHTML='<div class="dim">No transcript or chat timeline for this recording.</div>'; return; }
+  tl.innerHTML=items.map((it,i)=>{
+    const body = it.type==='t' ? esc(it.text)
+      : `${_ICON[it.ev.type]||'·'} <strong>${esc(it.ev.nickname||it.ev.user||'')}</strong>: ${it.ev.type==='gift'?'sent '+esc(it.ev.gift||'gift'):esc(it.ev.text||'')}`;
+    return `<div class="tl-item" id="tl-${i}" data-sec="${it.sec}"
+      onclick="$('player-video').currentTime=${it.sec}"
+      style="cursor:pointer;padding:3px 6px;border-radius:4px;${it.type==='c'?'color:#c9f;':''}">
+      <span class="dim" style="font-size:11px;">[${_fmtRel(it.sec)}]</span> ${body}</div>`;
+  }).join('');
+  v.ontimeupdate = _playerSync;
+}
+let _playerLast = -1;
+function _playerSync(){
+  const t=$('player-video').currentTime, items=_playerItems;
+  let idx=-1; for(let i=0;i<items.length;i++){ if(items[i].sec<=t+0.3) idx=i; else break; }
+  if(idx===_playerLast) return;
+  if(_playerLast>=0){ const p=$('tl-'+_playerLast); if(p) p.style.background=''; }
+  if(idx>=0){ const c=$('tl-'+idx); if(c){ c.style.background='#2d3a4a'; c.scrollIntoView({block:'nearest'}); } }
+  _playerLast=idx;
+}
+function closePlayer(){
+  const v=$('player-video'); v.pause(); v.ontimeupdate=null; v.removeAttribute('src'); v.load();
+  _playerItems=[]; _playerLast=-1; closeModal('modal-player');
 }
 
 // ── Bulk file operations ─────────────────────────────────────────

@@ -790,6 +790,21 @@
   </div>
 </div>
 
+<!-- ===== Playback modal ===== -->
+<div class="modal-bg" id="modal-player">
+  <div class="modal" style="width:920px;max-width:95vw;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 id="player-title" style="margin:0;font-size:14px;">Playback</h3>
+      <button class="cancel" onclick="closePlayer()">Close</button>
+    </div>
+    <div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;">
+      <video id="player-video" controls style="width:540px;max-width:100%;background:#000;border-radius:6px;"></video>
+      <div id="player-timeline" style="flex:1;min-width:240px;max-height:62vh;overflow:auto;font-size:12px;line-height:1.6;
+           background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;padding:8px;"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ===== Add watcher modal ===== -->
 <div class="modal-bg" id="modal-watcher">
   <div class="modal">
