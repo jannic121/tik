@@ -111,6 +111,9 @@ class Settings:
     max_attempts: int     = max(1, int(os.environ.get("WHISPER_MAX_ATTEMPTS", "3")))
     # Base backoff between attempts (doubles each time, capped at 1h).
     retry_backoff_sec: int = int(os.environ.get("WHISPER_RETRY_BACKOFF", "120"))
+    # Salvage: when a (corrupt/interrupted) recording won't decode directly, pull
+    # whatever audio ffmpeg can recover (skipping bad packets) and transcribe that.
+    salvage: bool         = os.environ.get("WHISPER_SALVAGE", "1") != "0"
 
     # ── 3rd-hop archive (rclone → any cloud) ─────────────────────────────────
     # Set ARCHIVE_REMOTE to an rclone remote+path (e.g. "dropbox:tt-recordings")
@@ -184,6 +187,35 @@ def _progress_path(mp4: Path) -> Path:
     return mp4.with_suffix(".progress")
 
 
+def _extract_audio_tolerant(src: Path) -> Optional[Path]:
+    """Fault-tolerant audio recovery for corrupt/interrupted recordings: skip bad
+    packets and pull whatever audio still decodes into a clean 16 kHz mono WAV that
+    Whisper can read. Returns the WAV path, or None if nothing usable came out.
+    (A recording missing its moov atom entirely usually can't be opened at all —
+    that's the one case this can't rescue.)"""
+    import tempfile as _tf
+    d = Path(_tf.mkdtemp(prefix="tw-salvage-"))
+    out = d / (src.stem + ".wav")
+    cmd = ["ffmpeg", "-nostdin", "-y",
+           "-err_detect", "ignore_err", "-fflags", "+discardcorrupt+genpts",
+           "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+           "-c:a", "pcm_s16le", str(out)]
+    try:
+        subprocess.run(cmd, timeout=3600,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[salvage] ffmpeg failed for {src.name}: {e}", flush=True)
+    if out.exists() and out.stat().st_size > 1024:
+        return out
+    try:
+        if out.exists():
+            out.unlink()
+        d.rmdir()
+    except OSError:
+        pass
+    return None
+
+
 def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
     """Run as a child process: `transcription_worker.py --transcribe-one <mp4> [--safe]`.
     Loads the model, transcribes incrementally, writes progress to <mp4>.progress
@@ -207,6 +239,7 @@ def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
         except OSError:
             pass
 
+    wav = None
     try:
         write_progress(pct=0.0, processed_sec=0.0, duration=None, done=False)
         from faster_whisper import WhisperModel
@@ -216,40 +249,67 @@ def _transcribe_one_subprocess(mp4_str: str, safe: bool = False) -> int:
             print(f"[transcribe-one] {mp4.name}: SAFE retry (vad off, beam 1)", flush=True)
         model = WhisperModel(settings.model, device=settings.device,
                              compute_type=settings.compute_type)
-        seg_iter, info = model.transcribe(
-            str(mp4), language=settings.language, beam_size=beam,
-            word_timestamps=True, vad_filter=vad,
-            vad_parameters={"min_silence_duration_ms": settings.vad_min_silence_ms},
-        )
-        duration = round(info.duration, 1) if info.duration else None
-        write_progress(pct=0.0, processed_sec=0.0, duration=duration,
-                       language=info.language, done=False)
 
-        segments = []
-        last_write = 0.0
-        for seg in seg_iter:               # generator → incremental progress
-            segments.append(seg)
-            now = time.time()
-            if now - last_write >= 1.0:     # throttle sidecar writes
-                pct = min(0.999, (seg.end / info.duration)) if info.duration else 0.0
-                write_progress(pct=round(pct, 4), processed_sec=round(seg.end, 1),
-                               duration=duration, language=info.language,
-                               segments=len(segments), done=False)
-                last_write = now
+        def _decode(src):
+            seg_iter, info = model.transcribe(
+                str(src), language=settings.language, beam_size=beam,
+                word_timestamps=True, vad_filter=vad,
+                vad_parameters={"min_silence_duration_ms": settings.vad_min_silence_ms},
+            )
+            dur = round(info.duration, 1) if info.duration else None
+            write_progress(pct=0.0, processed_sec=0.0, duration=dur,
+                           language=info.language, done=False)
+            segs, last_write = [], 0.0
+            for seg in seg_iter:           # generator → incremental progress
+                segs.append(seg)
+                now = time.time()
+                if now - last_write >= 1.0:
+                    pct = min(0.999, (seg.end / info.duration)) if info.duration else 0.0
+                    write_progress(pct=round(pct, 4), processed_sec=round(seg.end, 1),
+                                   duration=dur, language=info.language,
+                                   segments=len(segs), done=False)
+                    last_write = now
+            return segs, info, dur
+
+        # Fast path: decode the file directly. On a decode error — or a
+        # suspiciously-empty result from a possibly-corrupt stream — salvage the
+        # audio with a fault-tolerant ffmpeg pass (skip bad packets) and transcribe
+        # that, recovering as much speech as the file still contains.
+        try:
+            segments, info, duration = _decode(mp4)
+            if not segments and settings.salvage:
+                raise RuntimeError("no segments from direct decode")
+        except Exception as e:
+            if not settings.salvage:
+                raise
+            print(f"[transcribe-one] {mp4.name}: direct decode problem ({e}); "
+                  f"salvaging audio via ffmpeg…", flush=True)
+            wav = _extract_audio_tolerant(mp4)
+            if not wav:
+                raise RuntimeError(f"unsalvageable ({e})")
+            segments, info, duration = _decode(wav)
 
         txt = mp4.with_suffix(".txt")
         header = (f"# language={info.language} duration={duration}s "
-                  f"model={settings.model}\n\n")
+                  f"model={settings.model}{' salvaged' if wav else ''}\n\n")
         txt.write_text(header + _segments_to_txt(segments), encoding="utf-8")
         write_progress(pct=1.0, processed_sec=duration or 0.0, duration=duration,
                        language=info.language, segments=len(segments),
-                       words=sum(len(s.words or []) for s in segments), done=True)
+                       words=sum(len(s.words or []) for s in segments),
+                       done=True, salvaged=bool(wav))
         return 0
     except Exception as e:
         write_progress(done=True, error=str(e)[:500])
         print(f"[transcribe-one] {mp4.name} failed: {e}", flush=True)
         _tb.print_exc()
         return 1
+    finally:
+        if wav is not None:
+            try:
+                wav.unlink(missing_ok=True)
+                wav.parent.rmdir()
+            except OSError:
+                pass
 
 
 def _segments_to_txt(segments: list) -> str:
