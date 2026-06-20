@@ -146,8 +146,9 @@ CATALOG_ENABLED = os.environ.get("CATALOG_ENABLED", "0") == "1"
 _catalog = None   # set in lifespan when enabled
 # Where the Files tab gets its list: "live" (poll every node, default) or "catalog"
 # (one indexed DB read — fast + resilient to a flaky node). Falls back to live if
-# the catalog is off or errors. Flip with FILES_SOURCE=catalog; ?source= overrides.
-FILES_SOURCE = os.environ.get("FILES_SOURCE", "live")
+# the catalog is off or errors. Default catalog (when enabled); ?source= overrides.
+# Set FILES_SOURCE=live to force the legacy fan-out poll.
+FILES_SOURCE = os.environ.get("FILES_SOURCE", "catalog")
 
 # Strip ANSI/VT100 escape sequences from SSH output before sending to browser
 _ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -1456,6 +1457,9 @@ async def _transcript_index_cycle(batch: int = 40) -> dict:
         rec = await asyncio.to_thread(_catalog.find_by_filename, fn)
         if rec:
             creator, mtime = rec["creator"], rec["started_at"]
+            # Mark the transcript done in the catalog too, so catalog-backed
+            # transcript statuses are fresh ~here, not only after the shadow scan.
+            await asyncio.to_thread(_catalog.set_transcript, rec["id"], "done")
         else:
             parsed = parse_recording_name(fn)
             creator = parsed.creator if parsed else ""
@@ -2169,7 +2173,11 @@ async def list_files(source: Optional[str] = None):
     src = source or FILES_SOURCE
     if src == "catalog" and _catalog is not None:
         try:
-            return await _files_from_catalog()
+            items = await _files_from_catalog()
+            # If the catalog is enabled but not yet populated, don't show an empty
+            # Files tab — fall through to a one-off live scan instead.
+            if items or _catalog.conn.execute("SELECT 1 FROM recordings LIMIT 1").fetchone():
+                return items
         except Exception:
             log.exception("catalog-backed /api/files failed — falling back to live")
     async with _db_lock:
@@ -2562,8 +2570,15 @@ async def delete_file(body: DeleteFileBody):
 
 @app.get("/api/transcript-statuses", dependencies=[Depends(require_login)])
 async def transcript_statuses():
-    """Merge {filename: status} across all healthy storage servers.
-    'done' wins over any other status if a file appears on more than one."""
+    """{filename: status}. Served from the catalog (fast, works when a node is down)
+    when it's enabled and populated; otherwise the legacy fan-out across storage."""
+    if FILES_SOURCE == "catalog" and _catalog is not None:
+        try:
+            m = await asyncio.to_thread(_catalog.transcript_status_map)
+            if m:
+                return m
+        except Exception:
+            log.exception("catalog transcript-statuses failed — falling back to live")
     merged: dict[str, str] = {}
     rank = {"done": 3, "processing": 2, "pending": 1, "none": 0}
     for s in _storage_healthy():

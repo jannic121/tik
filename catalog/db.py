@@ -541,6 +541,14 @@ class Catalog:
             (recording_id,)).fetchone()
         return dict(r) if r else None
 
+    def transcript_status_map(self) -> dict:
+        """{recording_filename: 'done'|'pending'} for the Files tab, from the
+        transcripts table joined to recordings. Only non-'none' states."""
+        rows = self.conn.execute(
+            "SELECT r.filename AS fn, t.state AS st FROM transcripts t "
+            "JOIN recordings r ON r.id = t.recording_id WHERE t.state != 'none'").fetchall()
+        return {r["fn"]: r["st"] for r in rows if r["fn"]}
+
     def chat_match_map(self) -> dict:
         """{recording_filename: chat_filename} for all matched chat logs — lets the
         Files tab show a chat link per recording in one query."""
