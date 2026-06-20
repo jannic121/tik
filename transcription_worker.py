@@ -652,13 +652,18 @@ class TranscriptionWorker:
                     continue
                 size = item.get("Size")
                 try:
-                    if size is not None and int(size) != mp4.stat().st_size:
-                        log.warning("evict verify: %s remote size %s != local %s "
-                                    "(present, verified at archive time — allowing)",
-                                    mp4.name, size, mp4.stat().st_size)
+                    local = mp4.stat().st_size
+                    rsize = int(size) if size is not None else None
+                    # A remote copy SMALLER than local looks truncated/incomplete —
+                    # keep the local file. An equal-or-larger size is fine (an E2E
+                    # backend may report a larger, encrypted size).
+                    if rsize is not None and rsize < local:
+                        log.warning("evict verify: %s remote size %s < local %s — keeping local",
+                                    mp4.name, rsize, local)
+                        return False
                 except (OSError, ValueError, TypeError):
                     pass
-                return True                  # present on the remote by name
+                return True                  # present on the remote, not smaller
             return False                     # not found on remote — keep the local copy
         except Exception as e:
             log.warning("archive verify failed for %s: %s", mp4.name, e)
@@ -814,7 +819,11 @@ class TranscriptionWorker:
         try:
             subprocess.run(["rclone", "deletefile", remote],
                            timeout=120, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode("utf-8", errors="replace").strip()[-300:]
+            log.warning("retention purge: rclone deletefile failed for %s: %s", mp4.name, err or e)
+            return
         except Exception as e:
             log.warning("retention purge: rclone deletefile failed for %s: %s", mp4.name, e)
             return
@@ -1860,18 +1869,31 @@ async def archive_download(username: str = Query(...), filename: str = Query(...
     if not settings.archive_remote:
         raise HTTPException(400, "cloud archive is not configured on this server")
     for seg in (username, filename):
-        if "/" in seg or "\\" in seg or ".." in seg or seg in ("", ".", ".."):
+        if ("/" in seg or "\\" in seg or ".." in seg or seg in ("", ".", "..")
+                or any(ord(ch) < 32 for ch in seg)):
             raise HTTPException(400, "invalid path segment")
     remote = f"{settings.archive_remote.rstrip('/')}/{username}/{filename}"
     try:
+        # stderr DISCARDED (not PIPE) — an unread PIPE can fill and deadlock rclone.
         proc = await asyncio.create_subprocess_exec(
             "rclone", "cat", remote,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except FileNotFoundError:
         raise HTTPException(500, "rclone not installed")
 
+    # Peek the first chunk before committing to a 200: if rclone produced nothing
+    # and exited non-zero (missing/purged file, bad config), surface a real 404
+    # instead of a silent empty download.
+    first = await proc.stdout.read(65536)
+    if not first:
+        rc = await proc.wait()
+        if rc != 0:
+            raise HTTPException(404, "not found in the cloud archive (or archive misconfigured)")
+
     async def _stream():
         try:
+            if first:
+                yield first
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:

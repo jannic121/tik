@@ -3563,7 +3563,7 @@ async def storage_capacity():
             window_start = now - 12 * 3600
             ref = next((r for r in rows if r["ts"] <= window_start), rows[-1])
             dt_h = (newest["ts"] - ref["ts"]) / 3600.0
-            if dt_h > 0.05:
+            if dt_h > 0.05 and ref["free_bytes"] is not None and newest["free_bytes"] is not None:
                 rate = (ref["free_bytes"] - newest["free_bytes"]) / dt_h   # bytes/hr lost
                 e["fill_rate_bph"] = round(rate)
                 if rate > 0 and newest["free_bytes"] is not None:
@@ -3627,8 +3627,12 @@ async def files_cloud_download(username: str, filename: str,
             return StreamingResponse(
                 _stream(), media_type="video/mp4",
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-        except httpx.RequestError:
-            await client.aclose(); continue
+        except Exception:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            continue
     raise HTTPException(404, "not available from any cloud archive")
 
 
