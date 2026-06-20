@@ -594,7 +594,7 @@
     <div class="card">
       <h3>SSH connection</h3>
       <label>Host / IP
-        <input id="d-host" placeholder="1.2.3.4 or vps.example.com" />
+        <input id="d-host" placeholder="1.2.3.4 or vps.example.com" oninput="updatePortSummary()" />
       </label>
       <div class="row2">
         <label>User<input id="d-user" value="root" /></label>
@@ -623,19 +623,23 @@
         Storage server is auto-configured with the base Whisper model (~150MB,
         downloads on first transcription). Change model in /etc/tt-storage.env if needed.
       </p>
-      <details id="d-ports-section" style="margin-top:14px;border:1px solid #2a2a2a;border-radius:6px;padding:6px 12px;">
-        <summary style="cursor:pointer;font-size:13px;color:#9aa;">Ports
-          <span class="dim">— defaults are fine unless behind NAT or sharing an IP</span></summary>
-        <label style="margin-top:8px;">Service listen port (on the box)
-          <input id="d-listen-port" type="number" placeholder="8000 recorder / 8090 storage" />
+      <div id="d-ports-section" style="margin-top:14px;border:1px solid #2a2a2a;border-radius:8px;padding:10px 12px;">
+        <div id="d-ports-title" style="font-size:13px;color:#ddd;margin-bottom:6px;">Service &amp; port</div>
+        <label style="font-size:13px;">Port this service listens on
+          <input id="d-listen-port" type="number" oninput="updatePortSummary()" />
+          <span class="dim" id="d-listen-hint" style="font-size:11px;"></span>
         </label>
-        <div class="row2" style="margin-top:8px;">
-          <label>Control plane connects to — host<input id="d-pub-host" placeholder="defaults to the SSH host" /></label>
-          <label>port<input id="d-pub-port" type="number" placeholder="defaults to the listen port" /></label>
-        </div>
-        <span class="dim" style="font-size:11px;">Behind NAT, set these to the public IP and the forwarded port.
-          The box binds the listen port; the control plane registers and connects to the host:port above.</span>
-      </details>
+        <p id="d-port-summary" style="font-size:12px;color:#6ee7a7;margin:8px 0 0;line-height:1.6;"></p>
+        <details style="margin-top:8px;">
+          <summary style="cursor:pointer;font-size:12px;color:#9aa;">Behind NAT / different public address?</summary>
+          <p class="dim" style="font-size:11px;margin:6px 0;">Only if the control plane can't reach the box directly on the address above
+            (e.g. port-forwarded NAT, or two servers sharing one public IP). Set where the control plane should connect instead.</p>
+          <div class="row2">
+            <label style="font-size:12px;">Public host<input id="d-pub-host" placeholder="defaults to the SSH host" oninput="updatePortSummary()"/></label>
+            <label style="font-size:12px;">Public / forwarded port<input id="d-pub-port" type="number" placeholder="defaults to the listen port" oninput="updatePortSummary()"/></label>
+          </div>
+        </details>
+      </div>
       <!-- Push update section -->
       <div id="d-push-section" style="display:none">
         <h3 style="margin-top:18px;">Push update</h3>
@@ -848,7 +852,7 @@ function switchTab(name) {
   ({servers:loadServers, watchers:loadWatchers, files:loadFiles,
     transcription:loadTranscription, updates:loadUpdates, catalog:loadCatalog,
     search:loadSearchIndex, chat:loadChat, routing:loadRouting,
-    archive:loadArchive, deploy:()=>{}})[name]?.();
+    archive:loadArchive, deploy:updatePortSummary})[name]?.();
 }
 
 // Servers tab = recorders + storage/transcription together.
@@ -2736,6 +2740,7 @@ function setDeployType(type) {
   $('d-note-storage')  && ($('d-note-storage').style.display  = isSto ? '' : 'none');
   $('d-push-section').style.display = isPush ? '' : 'none';
   $('d-ports-section') && ($('d-ports-section').style.display = isPush ? 'none' : '');
+  updatePortSummary();
   ['recorder','storage','push'].forEach(t => {
     const el = $('dtype-'+t); if (!el) return;
     el.style.background = type===t ? '#2d2d2d' : '';
@@ -2745,6 +2750,28 @@ function setDeployType(type) {
   $('d-result').style.display = 'none';
   $('d-out').textContent = '';
   if (isPush) loadPushTargets();
+}
+
+function _deployDefaultPort() { return _currentDeployType === 'storage' ? 8090 : 8000; }
+
+// Live, plain-English summary of what will be deployed and where the control
+// plane will reach it. Connect address follows the listen port by default.
+function updatePortSummary() {
+  if (_currentDeployType === 'push') return;
+  const isSto = _currentDeployType === 'storage';
+  const svc = isSto ? 'Storage server' : 'Recorder backend';
+  const unit = isSto ? 'tt-transcription' : 'tt-backend';
+  const def = _deployDefaultPort();
+  const listen = parseInt($('d-listen-port').value, 10) || def;
+  const host = ($('d-host').value || '').trim() || 'this server';
+  const pubHost = ($('d-pub-host').value || '').trim() || (($('d-host').value || '').trim() || 'this server');
+  const pubPort = parseInt($('d-pub-port').value, 10) || listen;
+  const hint = $('d-listen-hint'); if (hint) hint.textContent = ` — default ${def}`;
+  const title = $('d-ports-title'); if (title) title.textContent = `${svc} (${unit}) — port`;
+  const s = $('d-port-summary');
+  if (s) s.innerHTML =
+    `• Binds <span class="mono">0.0.0.0:${listen}</span> on <span class="mono">${esc(host)}</span><br>`
+    + `• Control plane will connect to <span class="mono">http://${esc(pubHost)}:${pubPort}</span>`;
 }
 
 // ── Push update ───────────────────────────────────────────────────
@@ -2844,7 +2871,7 @@ async function runDeploy() {
     btn.disabled = false; btn.textContent = 'Deploy'; return;
   }
 
-  const listenPort = parseInt($('d-listen-port').value, 10) || 0;
+  const listenPort = parseInt($('d-listen-port').value, 10) || _deployDefaultPort();
   const body = {
     deploy_type:  _currentDeployType,
     host,
@@ -2874,8 +2901,7 @@ async function runDeploy() {
     }
 
     const pubHost = ($('d-pub-host').value||'').trim() || host;
-    const pubPort = parseInt($('d-pub-port').value,10) || listenPort
-                    || (_currentDeployType==='storage' ? 8090 : 8000);
+    const pubPort = parseInt($('d-pub-port').value,10) || listenPort;
     const regUrl = `http://${pubHost}:${pubPort}`;
     const sshPort = parseInt($('d-port').value,10);
     if (_currentDeployType === 'storage') {
