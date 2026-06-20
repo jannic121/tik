@@ -126,6 +126,7 @@
     <button data-tab="catalog"   onclick="switchTab('catalog')">Catalog</button>
     <button data-tab="search"   onclick="switchTab('search')">Search</button>
     <button data-tab="chat"      onclick="switchTab('chat')">Chat</button>
+    <button data-tab="cookies"  onclick="switchTab('cookies')">🍪 Cookies</button>
     <button data-tab="routing"  onclick="switchTab('routing')">Routing</button>
     <button data-tab="archive"  onclick="switchTab('archive')">Archive</button>
     <button data-tab="deploy"   onclick="switchTab('deploy')">Deploy</button>
@@ -440,6 +441,21 @@
   </div>
 </div>
 
+
+<section class="panel" id="panel-cookies">
+  <div class="panel-head">
+    <h2>TikTok cookies</h2>
+    <div class="actions">
+      <button class="ghost" onclick="loadCookies()">Refresh</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:#888;margin:0 0 14px;max-width:680px;">
+    Cookies are stored per recorder backend. They are picked up on the next
+    recording session — no restart needed. <code>sessionid_ss</code> is required;
+    if it's missing or expired, recordings of restricted streams will fail.
+  </p>
+  <div id="cookies-content"><div class="dim" style="padding:10px;">Loading…</div></div>
+</section>
 
 <section class="panel" id="panel-routing">
   <div class="panel-head">
@@ -889,6 +905,25 @@
     <div class="btn-row">
       <button class="cancel" onclick="closeModal('modal-watcher')">Cancel</button>
       <button class="primary" onclick="submitWatcher()">Add</button>
+    </div>
+  </div>
+</div>
+
+<!-- Migrate watcher modal -->
+<div class="modal-bg" id="modal-migrate" onclick="if(event.target===this)closeModal('modal-migrate')">
+  <div class="modal">
+    <h3>Move watcher <span id="migrate-user" style="color:#9cf;"></span></h3>
+    <p class="dim" style="font-size:13px;margin:0 0 10px;">
+      Adds the watcher on the target backend first, then removes it from the current one —
+      its interval and chat setting come along. A recording in progress on the old backend
+      is stopped.</p>
+    <label>Target backend
+      <select id="migrate-target"></select>
+    </label>
+    <div class="modal-err" id="migrate-msg"></div>
+    <div class="btn-row">
+      <button class="cancel" onclick="closeModal('modal-migrate')">Cancel</button>
+      <button class="primary" id="migrate-go" onclick="submitMigrate()">Move</button>
     </div>
   </div>
 </div>

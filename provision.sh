@@ -141,8 +141,8 @@ STATE_FILE=/var/lib/tt-recorder/state.json
 # the recorder and storage server are on separate machines).
 RECORDER_SETTLE_SEC=120
 
-# Capacity
-MAX_WATCHERS=30
+# Capacity (0 = unlimited)
+MAX_WATCHERS=0
 
 # Max random delay (seconds) before a watcher's first spawn after a restart
 # or re-enable, so they don't all hit TikTok at once. 0 disables.

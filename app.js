@@ -37,8 +37,8 @@ function switchTab(name) {
     p=>p.classList.toggle('active', p.id==='panel-'+name));
   ({servers:loadServers, watchers:loadWatchers, files:loadFiles,
     transcription:loadTranscription, updates:loadUpdates, catalog:loadCatalog,
-    search:loadSearchIndex, chat:loadChat, routing:loadRouting,
-    archive:loadArchive, deploy:updatePortSummary})[name]?.();
+    search:loadSearchIndex, chat:loadChat, cookies:loadCookies,
+    routing:loadRouting, archive:loadArchive, deploy:updatePortSummary})[name]?.();
 }
 
 // Servers tab = recorders + storage/transcription together.
@@ -252,7 +252,9 @@ async function loadBackends() {
       const h=b.health||{};
       const hcls=b.last_health_ok?'ok':(b.last_health_check?'bad':'unknown');
       const htxt=b.last_health_ok?'OK':(b.last_health_check?'OFFLINE':'UNKNOWN');
-      const load=h.max_watchers!=null?`${h.active_watchers}/${h.max_watchers}`:'–';
+      const load=h.active_watchers!=null
+        ? `${h.active_watchers}/${(h.max_watchers&&h.max_watchers>0)?h.max_watchers:'∞'}`
+        : '–';
       let bHost=''; try { bHost=new URL(b.url).hostname; } catch(_){}
       const colocBadge = (b.machine && storageMachines.has(b.machine))
         ? `<span style="background:#1a2a3a;color:#9cf;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;" title="Same machine also runs a storage/transcription server — one box doing both roles">📦 colocated · ${esc(bHost)}</span>`
@@ -349,7 +351,7 @@ async function loadWatchers() {
         <td>${f>0?`<span style="color:#fa6">${f}</span>`:'0'}</td>
         <td class="dim" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(w.last_error||'')}">${esc(w.last_error||'')}</td>
         <td class="dim">${fmtAgo(w.created_at)}</td>
-        <td style="white-space:nowrap;">${reenable}<button class="danger" onclick="deleteWatcher('${esc(w.username)}')">Remove</button></td>
+        <td style="white-space:nowrap;">${reenable}<button class="ghost" onclick="openMigrate('${esc(w.username)}','${esc(w.backend_pk)}')" style="font-size:11px;padding:3px 8px;" title="Move to another backend">↪ Move</button> <button class="danger" onclick="deleteWatcher('${esc(w.username)}')">Remove</button></td>
       </tr>`;
     }).join('')}</tbody></table>`;
 }
@@ -481,6 +483,35 @@ async function deleteWatcher(username) {
   if (!confirm(`Remove watcher for ${username}?`)) return;
   const r=await api(`/api/watchers/${encodeURIComponent(username)}`,{method:'DELETE'});
   if (r&&r.status===204) loadWatchers();
+}
+
+let _migrateUser=null;
+async function openMigrate(username, currentPk) {
+  _migrateUser=username;
+  $('migrate-user').textContent=username;
+  const sel=$('migrate-target'), msg=$('migrate-msg');
+  msg.textContent=''; sel.innerHTML='<option>loading…</option>';
+  openModal('modal-migrate');
+  const r=await api('/api/backends'); if(!r){sel.innerHTML='<option>error</option>';return;}
+  const bks=await r.json();
+  const opts=bks.filter(b=>b.id!==currentPk).map(b=>{
+    const healthy=b.last_health_ok;
+    const load=(b.health&&b.health.active_watchers!=null)
+      ? ` · ${b.health.active_watchers} watchers` : '';
+    return `<option value="${esc(b.id)}" ${healthy?'':'disabled'}>${esc(b.backend_id||b.id)}${load}${healthy?'':' (offline)'}</option>`;
+  }).join('');
+  sel.innerHTML = opts || '<option value="" disabled>no other backend registered</option>';
+}
+
+async function submitMigrate() {
+  const pk=$('migrate-target').value, msg=$('migrate-msg');
+  if(!pk){msg.textContent='Pick a target backend.';return;}
+  const btn=$('migrate-go'); btn.disabled=true; msg.textContent='Moving…';
+  const r=await api(`/api/watchers/${encodeURIComponent(_migrateUser)}/migrate`,
+    {method:'POST',body:JSON.stringify({backend_pk:pk})});
+  btn.disabled=false;
+  if (r && r.ok){ closeModal('modal-migrate'); loadWatchers(); }
+  else { let t='migration failed'; try{t=(await r.json()).detail||t;}catch(e){} msg.textContent='✗ '+t; }
 }
 
 // ── Files ─────────────────────────────────────────────────────────
@@ -1385,6 +1416,91 @@ async function saveCookies() {
     s.style.color = '#f99';
     s.textContent = 'Save failed — check the backend is reachable.';
   }
+}
+
+// ── Cookies overview tab ─────────────────────────────────────────
+async function loadCookies() {
+  const el = $('cookies-content');
+  el.innerHTML = '<div class="dim" style="padding:10px;">Loading…</div>';
+
+  // Fetch backend list first
+  const br = await api('/api/backends'); if (!br) return;
+  const backends = await br.json();
+  if (!backends.length) {
+    el.innerHTML = '<div class="empty">No recorder backends registered.</div>';
+    return;
+  }
+
+  // Fetch cookies from all backends in parallel
+  const results = await Promise.all(backends.map(async b => {
+    try {
+      const r = await api(`/api/backends/${b.id}/cookies`);
+      if (r && r.ok) return { backend: b, cookies: await r.json(), err: null };
+      return { backend: b, cookies: null, err: `HTTP ${r ? r.status : '?'}` };
+    } catch (e) {
+      return { backend: b, cookies: null, err: e.message };
+    }
+  }));
+
+  el.innerHTML = results.map(({ backend: b, cookies: ck, err }) => {
+    const label = esc(b.backend_id || b.id);
+    const online = b.last_health_ok;
+
+    if (err || !online) {
+      const msg = !online ? 'backend offline' : err;
+      return `<div class="card" style="border:1px solid #3a2a2a;border-radius:8px;padding:14px;
+              margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <strong>${label}</strong>
+          <span style="margin-left:8px;font-size:11px;color:#fa6;">⚠ ${esc(msg)}</span>
+        </div>
+        <button class="ghost" onclick="openCookies('${esc(b.id)}','${label}')"
+                style="font-size:11px;padding:3px 10px;">Edit</button>
+      </div>`;
+    }
+
+    const keys = ck ? Object.keys(ck) : [];
+    const hasSession = ck && (ck['sessionid_ss'] || ck['sessionid']);
+    const sessionVal = ck && (ck['sessionid_ss'] || ck['sessionid'] || '');
+    const idcVal = ck && (ck['tt-target-idc'] || '');
+    const isEmpty = keys.length === 0;
+
+    const statusDot = isEmpty
+      ? `<span style="color:#fa6;">⚠ no cookies set</span>`
+      : hasSession
+        ? `<span style="color:#6ee7a7;">✓ cookies set</span>`
+        : `<span style="color:#fa6;">⚠ sessionid_ss missing</span>`;
+
+    const cookieRows = keys.length
+      ? keys.map(k => {
+          const v = String(ck[k]);
+          // Partially mask long token-like values for display
+          const display = v.length > 40
+            ? `<span style="font-family:monospace;font-size:11px;">${esc(v.slice(0,12))}…${esc(v.slice(-6))}</span>`
+            : `<span style="font-family:monospace;font-size:11px;">${esc(v)}</span>`;
+          const highlight = (k === 'sessionid_ss' || k === 'sessionid')
+            ? 'color:#9cf;font-weight:600;' : 'color:#888;';
+          return `<tr>
+            <td style="${highlight}font-size:12px;padding:4px 8px 4px 0;white-space:nowrap;">${esc(k)}</td>
+            <td style="font-size:12px;padding:4px 0;color:#bbb;">${display}</td>
+          </tr>`;
+        }).join('')
+      : `<tr><td colspan="2" style="color:#666;font-size:12px;padding:4px 0;">No cookies stored — recordings of restricted streams will fail.</td></tr>`;
+
+    return `<div class="card" style="border:1px solid #2a2a2a;border-radius:8px;padding:14px;margin-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+        <div>
+          <strong>${label}</strong>
+          <span style="margin-left:10px;font-size:12px;">${statusDot}</span>
+        </div>
+        <button class="ghost" onclick="openCookies('${esc(b.id)}','${label}');setTimeout(loadCookies,600);"
+                style="font-size:11px;padding:3px 10px;">Edit</button>
+      </div>
+      <table style="width:100%;border-collapse:collapse;">
+        ${cookieRows}
+      </table>
+    </div>`;
+  }).join('');
 }
 
 // ── Storage ──────────────────────────────────────────────────────

@@ -2024,7 +2024,8 @@ async def _pick_backend() -> sqlite3.Row:
         ).fetchall()
     for r in rows:
         h = json.loads(r["last_health_data"] or "{}")
-        if r["load"] < h.get("max_watchers", 30):
+        cap = h.get("max_watchers") or 0          # 0 / missing = unlimited
+        if cap <= 0 or r["load"] < cap:
             return r
     raise HTTPException(503, "no healthy backend with capacity")
 
@@ -2113,6 +2114,72 @@ async def delete_watcher(username: str):
         db.execute("DELETE FROM watchers WHERE username=?", (username,))
         db.commit()
     return Response(status_code=204)
+
+
+class WatcherMigrateIn(BaseModel):
+    backend_pk: str
+
+
+@app.post("/api/watchers/{username}/migrate", dependencies=[Depends(require_login)])
+async def migrate_watcher(username: str, body: WatcherMigrateIn):
+    """Move a watcher from its current backend to another one.
+
+    Adds the watcher on the target backend first (preserving its interval and
+    chat-capture setting), and only removes it from the old backend once the
+    new one accepts it — so a failed move never drops the watcher entirely."""
+    username = username.lstrip("@").strip().lower()
+    async with _db_lock:
+        cur = db.execute(
+            "SELECT w.username, w.backend_pk, w.automatic_interval_min, "
+            "b.url, b.auth_token "
+            "FROM watchers w JOIN backends b ON b.id=w.backend_pk WHERE w.username=?",
+            (username,),
+        ).fetchone()
+        tgt = db.execute(
+            "SELECT id,url,auth_token,backend_id,last_health_ok "
+            "FROM backends WHERE id=?", (body.backend_pk,),
+        ).fetchone()
+    if not cur:
+        raise HTTPException(404, "no watcher")
+    if not tgt:
+        raise HTTPException(404, "target backend not found")
+    if cur["backend_pk"] == tgt["id"]:
+        raise HTTPException(400, "watcher is already on that backend")
+    if not tgt["last_health_ok"]:
+        raise HTTPException(409, "target backend is not healthy")
+
+    # Pull the watcher's live settings off the source so the move is faithful.
+    interval = cur["automatic_interval_min"]
+    capture_chat = True
+    code, body_src = await _call(cur["url"], cur["auth_token"], "GET", "/watchers")
+    if code == 200 and isinstance(body_src, list):
+        for it in body_src:
+            if it.get("username") == username:
+                interval = it.get("automatic_interval_min", interval)
+                capture_chat = it.get("capture_chat", True)
+                break
+
+    # 1. Add on the target backend.
+    code, resp = await _call(tgt["url"], tgt["auth_token"], "POST", "/watchers",
+                             {"username": username,
+                              "automatic_interval_min": interval,
+                              "capture_chat": capture_chat})
+    if code == 409:
+        pass  # already present on target — treat as success, just re-point DB
+    elif code != 201:
+        raise HTTPException(502 if code < 0 else code,
+                            f"target backend refused: {resp}")
+
+    # 2. Remove from the old backend (best-effort — already added on target).
+    await _call(cur["url"], cur["auth_token"], "DELETE", f"/watchers/{username}")
+
+    # 3. Re-point the DB.
+    async with _db_lock:
+        db.execute("UPDATE watchers SET backend_pk=? WHERE username=?",
+                   (tgt["id"], username))
+        db.commit()
+    return {"ok": True, "username": username,
+            "backend_pk": tgt["id"], "backend_label": tgt["backend_id"]}
 
 
 @app.post("/api/watchers/{username}/restart", dependencies=[Depends(require_login)])

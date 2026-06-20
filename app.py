@@ -14,7 +14,7 @@ Env vars:
     PYTHON_EXECUTABLE     python to invoke (default: python3; use the venv's python)
     RECORDINGS_ROOT       where per-creator subdirs live (default: /data/recordings)
     STATE_FILE            JSON file persisting the watchlist (default: /var/lib/tt-recorder/state.json)
-    MAX_WATCHERS          soft cap per backend (default: 30)
+    MAX_WATCHERS          soft cap per backend (default: 0 = unlimited)
     CONTROL_PLANE_URL     base URL where lifecycle events are POSTed (events go to {URL}/events)
     CONTROL_PLANE_TOKEN   bearer token sent on outgoing webhooks
 """
@@ -80,7 +80,8 @@ class Settings:
     # corrupt orphans older than this many days (reclaims space, loses the file).
     reap_delete_corrupt_days: float = float(os.environ.get("FLV_REAP_DELETE_CORRUPT_DAYS", "0"))
     state_file: Path = Path(os.environ.get("STATE_FILE", "/var/lib/tt-recorder/state.json"))
-    max_watchers: int = int(os.environ.get("MAX_WATCHERS", "30"))
+    # Soft cap on watchers per backend. 0 (the default) means unlimited.
+    max_watchers: int = int(os.environ.get("MAX_WATCHERS", "0"))
     # Max random delay (seconds) before a watcher's first spawn, so a mass
     # start (restart / re-enable) doesn't hit TikTok all at once. 0 disables.
     startup_jitter_sec: float = float(os.environ.get("WATCHER_STARTUP_JITTER_SEC", "20"))
@@ -162,7 +163,7 @@ class WatcherManager:
         async with self._lock:
             if username in self._watchers:
                 raise HTTPException(409, f"watcher for {username} already exists")
-            if len(self._watchers) >= settings.max_watchers:
+            if settings.max_watchers and len(self._watchers) >= settings.max_watchers:
                 raise HTTPException(
                     503,
                     f"backend at capacity ({settings.max_watchers} watchers)",
