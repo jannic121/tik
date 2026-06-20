@@ -97,12 +97,10 @@ if ! command -v rclone >/dev/null 2>&1; then
 fi
 
 # untrunc (optional) — rebuilds recordings whose moov atom is broken/missing so
-# the transcriber can still salvage audio from them. Not packaged; build it from
-# source if you want that last-resort recovery, then it's auto-used:
-#   apt-get install -y git build-essential
-#   git clone https://github.com/anthwlock/untrunc /opt/untrunc && make -C /opt/untrunc
-#   ln -sf /opt/untrunc/untrunc /usr/local/bin/untrunc
-# (ffmpeg-based salvage works without it; untrunc only helps the moov-less case.)
+# the transcriber can still salvage audio from them. Install it one-click from the
+# control plane (Servers → storage server → ⚙ Configure → Install untrunc), which
+# builds it over SSH. ffmpeg-based salvage works without it; untrunc only helps the
+# moov-less case.
 
 # Filen CLI — only needed to export an API key for the Filen archive backend. The
 # control plane can also install this on demand, but pre-installing means the

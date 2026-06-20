@@ -3661,6 +3661,70 @@ async def storage_oom_protect(sid: str):
     return _threaded_stream(work)
 
 
+def _ssh_install_untrunc(host: str, port: int, user: str, auth_method: str,
+                         password, key_path, emit) -> None:
+    """Build + install untrunc on a storage box (root over SSH) so the transcriber
+    can rebuild moov-less recordings. Best-effort: streams apt/git/make output; if
+    the build fails you see why, and ffmpeg salvage still works without it."""
+    sudo = "" if user == "root" else "sudo -n "
+    script = f"""set -e
+export DEBIAN_FRONTEND=noninteractive
+echo '==> Installing build dependencies (apt)…'
+{sudo}apt-get update -qq
+{sudo}apt-get install -y --no-install-recommends git build-essential pkg-config \
+  libavformat-dev libavcodec-dev libavutil-dev
+echo '==> Fetching untrunc source…'
+{sudo}rm -rf /opt/untrunc
+{sudo}git clone --depth 1 https://github.com/anthwlock/untrunc /opt/untrunc
+echo '==> Building (this can take a couple of minutes)…'
+{sudo}make -C /opt/untrunc
+if [ -x /opt/untrunc/untrunc ]; then
+  {sudo}ln -sf /opt/untrunc/untrunc /usr/local/bin/untrunc
+  echo "UNTRUNC_OK"
+else
+  echo "UNTRUNC_FAIL"
+fi
+"""
+    client = _ssh_connect(host, port, user, auth_method, password, key_path, emit)
+    if not client:
+        return
+    try:
+        emit(f"==> Installing untrunc on {host}:{port} …\n\n")
+        _, stdout, _ = client.exec_command(script, get_pty=True, timeout=900)
+        for raw in iter(stdout.readline, ""):
+            emit(_ANSI.sub("", raw))
+        rc = stdout.channel.recv_exit_status()
+        emit("\n==> untrunc installed — moov rebuild is now available.\n" if rc == 0
+             else "\n[ERROR] install did not complete cleanly (see output above). "
+                  "ffmpeg-based salvage still works without untrunc.\n")
+    except Exception as e:
+        emit(f"\n[ERROR] {type(e).__name__}: {e}\n")
+    finally:
+        client.close()
+
+
+@app.post("/api/storage/{sid}/install-untrunc", dependencies=[Depends(require_login)])
+async def storage_install_untrunc(sid: str):
+    """One-click: build + install untrunc on a storage box using saved SSH creds."""
+    s = _storage_by_id(sid)
+    if not s:
+        raise HTTPException(404, "storage server not found")
+    host, port = _ssh_target(s)
+    creds = _get_creds_mkey(host, port) if host else None
+
+    def work(emit):
+        if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
+            emit(f"No saved SSH credentials for {host}:{port}. Configure the archive or "
+                 "run a Push update for this server once, then this is one click.\n")
+            return
+        _ssh_install_untrunc(host, port, creds.get("ssh_user") or "root",
+                             creds.get("auth_method") or "key",
+                             _decrypt_pw(creds.get("password_enc")),
+                             creds.get("key_path"), emit)
+
+    return _threaded_stream(work)
+
+
 @app.post("/api/storage/{sid}/worker-config", dependencies=[Depends(require_login)])
 async def storage_worker_config(sid: str, req: WorkerConfigRequest):
     host = _archive_host_for(sid)

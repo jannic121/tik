@@ -2117,6 +2117,20 @@ async function applyWorkerConfig() {
   finally { btn.disabled=false; btn.textContent='Apply & restart'; setTimeout(loadStorage,1500); }
 }
 
+async function installUntrunc() {
+  if (!_wcfgSid) return;
+  const out=$('wcfg-out'), btn=$('wcfg-untrunc');
+  out.style.display=''; out.textContent=''; btn.disabled=true; btn.textContent='Installing…';
+  try {
+    const resp=await fetch(`/api/storage/${_wcfgSid}/install-untrunc`,{method:'POST',credentials:'include'});
+    if(!resp.ok){ out.textContent+=`[ERROR] HTTP ${resp.status}\n`+await resp.text(); }
+    else { const rd=resp.body.getReader(), dec=new TextDecoder();
+      while(true){const {value,done}=await rd.read(); if(done)break;
+        out.textContent+=dec.decode(value,{stream:true}); out.scrollTop=out.scrollHeight;} }
+  } catch(e){ out.textContent+='\n[ERROR] '+e.message; }
+  finally { btn.disabled=false; btn.textContent='🔧 Install untrunc (moov repair)'; }
+}
+
 async function saveStorage() {
   const url = $('st-url').value.trim();
   const token = $('st-token').value.trim();

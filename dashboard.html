@@ -258,6 +258,11 @@
         <span class="dim" style="font-size:11px;">Saved per host — leave blank to reuse the last credentials for this server.</span>
       </details>
       <pre id="wcfg-out" style="display:none;background:#0e0e0e;border:1px solid #2a2a2a;border-radius:6px;padding:8px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap;font-size:11px;"></pre>
+      <div style="border-top:1px solid #2a2a2a;margin-top:10px;padding-top:8px;">
+        <button class="ghost" id="wcfg-untrunc" onclick="installUntrunc()" style="font-size:12px;"
+                title="Build + install untrunc so the transcriber can rebuild recordings with a broken/missing moov atom">🔧 Install untrunc (moov repair)</button>
+        <span class="dim" style="font-size:11px;">Optional — lets salvage recover truly-truncated recordings. ffmpeg salvage works without it.</span>
+      </div>
       <div class="btn-row">
         <button class="cancel" onclick="closeModal('modal-wcfg')">Cancel</button>
         <button class="primary" id="wcfg-apply" onclick="applyWorkerConfig()">Apply &amp; restart</button>
