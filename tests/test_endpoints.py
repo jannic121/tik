@@ -181,6 +181,22 @@ def test_audio_transcribe_run_now_409_when_disabled():
     assert r.status_code == 409, r.text
 
 
+def test_audio_transcribe_config_toggle_roundtrip():
+    assert _c.get("/api/audio-transcribe/status").json()["enabled"] is False
+    assert _c.post("/api/audio-transcribe/config", json={"enabled": True}).status_code == 200
+    assert _c.get("/api/audio-transcribe/status").json()["enabled"] is True
+    # now run-now is allowed (no backends, so it just ships 0)
+    r = _c.post("/api/audio-transcribe/run-now")
+    assert r.status_code == 200 and "pushed" in r.json()
+    # restore
+    _c.post("/api/audio-transcribe/config", json={"enabled": False})
+
+
+def test_storage_audio_only_404_on_unknown_server():
+    r = _c.post("/api/storage/nope/audio-only", json={"enabled": True})
+    assert r.status_code == 404
+
+
 # ---- catalog cutover -----------------------------------------------------
 
 def test_default_files_source_is_catalog():

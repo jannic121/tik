@@ -978,10 +978,75 @@ async function loadTranscription(){
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button class="ghost" style="font-size:11px;" onclick="oomProtect('${sv.sid}',this)"
           title="Make transcription the OOM victim so the control plane survives memory pressure">🛡 Protect from OOM</button>
+        <button class="ghost" style="font-size:11px;${d.audio_only?'color:#6ee7a7;border-color:#2d5a3f;':''}"
+          onclick="toggleAudioOnly('${sv.sid}',${!d.audio_only},this)"
+          title="Audio-first: when on, this box transcribes only small audio pushed by the control plane and ignores full MP4s">
+          🎧 Audio-only: ${d.audio_only?'on':'off'}</button>
         <pre id="oom-${sv.sid}" style="display:none;flex:1;background:#111;border-radius:6px;padding:8px;font-size:11px;white-space:pre-wrap;margin:0;"></pre>
       </div>
     </div>`;
   }).join('');
+  renderAudioFirst();
+}
+
+// ── Audio-first pipeline controls ────────────────────────────────
+async function renderAudioFirst(){
+  const box=$('audiofirst-card'); if(!box) return;
+  const r=await api('/api/audio-transcribe/status');
+  if(!r){ box.innerHTML=''; return; }
+  const s=await r.json();
+  const on=s.enabled;
+  box.innerHTML=`<div class="card" style="margin-bottom:14px;border-left:3px solid ${on?'#6ee7a7':'#555'};">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div>
+        <strong>🎙 Audio-first transcription</strong>
+        <span style="font-size:11px;color:#888;margin-left:8px;">recorders extract a small audio track; the full video bypasses this box</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:${on?'#6ee7a7':'#888'};">${on?'● ON':'○ off'}</span>
+        <button class="${on?'ghost':'primary'}" style="font-size:12px;padding:4px 12px;"
+          onclick="toggleAudioFirst(${!on},this)">${on?'Turn off':'Turn on'}</button>
+        <button class="ghost" style="font-size:12px;padding:4px 12px;" ${on?'':'disabled'}
+          onclick="audioRunNow(this)">Run now</button>
+      </div>
+    </div>
+    <div style="font-size:12px;color:#999;margin-top:8px;">
+      ${on?`In flight: <strong>${s.in_flight}</strong> · checks every ${s.interval_sec}s.`:''}
+      For this to work, also flip each transcription box to <strong>🎧 Audio-only</strong> below
+      (otherwise it double-transcribes the MP4s it still receives).
+    </div>
+    <pre id="audiofirst-out" style="display:none;background:#111;border-radius:6px;padding:8px;font-size:11px;white-space:pre-wrap;margin:8px 0 0;"></pre>
+  </div>`;
+}
+
+async function toggleAudioFirst(enable, btn){
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  const r=await api('/api/audio-transcribe/config',{method:'POST',body:JSON.stringify({enabled:enable})});
+  if(r&&r.ok){ renderAudioFirst(); }
+  else { if(btn)btn.disabled=false; alert('Could not change the setting.'); }
+}
+
+async function audioRunNow(btn){
+  const out=$('audiofirst-out'); if(out){ out.style.display='block'; out.textContent='Shipping a batch…'; }
+  if(btn) btn.disabled=true;
+  const r=await api('/api/audio-transcribe/run-now',{method:'POST'});
+  if(btn) btn.disabled=false;
+  if(r&&r.ok){ const d=await r.json(); if(out) out.textContent=`Shipped ${d.pushed} audio track(s) this pass.`; setTimeout(renderAudioFirst,800); }
+  else if(out){ let t='failed'; try{t=(await r.json()).detail||t;}catch(e){} out.textContent='✗ '+t; }
+}
+
+async function toggleAudioOnly(sid, enable, btn){
+  const out=$('oom-'+sid);
+  if(btn){ btn.disabled=true; btn.textContent='Applying…'; }
+  if(out){ out.style.display='block'; out.textContent=''; }
+  try{
+    const res=await fetch('/api/storage/'+sid+'/audio-only',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enable})});
+    const reader=res.body.getReader(), dec=new TextDecoder();
+    while(true){ const {value,done}=await reader.read(); if(done)break;
+      if(out){ out.textContent+=dec.decode(value,{stream:true}); out.scrollTop=out.scrollHeight; } }
+  }catch(e){ if(out) out.textContent+='\n[ERROR] '+e.message; }
+  setTimeout(loadTranscription, 1200);
 }
 
 async function oomProtect(sid, btn){

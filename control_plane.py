@@ -292,6 +292,15 @@ def _load_config() -> None:
                 setattr(settings, key, row["value"])
     except Exception:
         pass
+    # Runtime-toggleable flag (UI-settable; persisted so it survives restarts and
+    # overrides the env default once you've flipped it from the dashboard).
+    try:
+        row = db.execute("SELECT value FROM config WHERE key='transcribe_from_audio'"
+                         ).fetchone()
+        if row is not None:
+            settings.transcribe_from_audio = row["value"] == "1"
+    except Exception:
+        pass
     # One-time migration: if a single storage server is configured (via the old
     # config table or env vars) and the storage_servers table is empty, import it.
     try:
@@ -3835,6 +3844,7 @@ def _archive_host_for(sid: str) -> Optional[str]:
 class WorkerConfigRequest(BaseModel):
     concurrency: Optional[int]      = Field(None, ge=0, le=16)
     transcribe_enabled: Optional[bool] = None
+    audio_only: Optional[bool]      = None
     model: Optional[str]            = Field(None, max_length=64,
                                             pattern=r"^[A-Za-z0-9._/-]+$")
     vad: Optional[bool]             = None
@@ -3855,6 +3865,8 @@ def _ssh_worker_config(req: "WorkerConfigRequest", host: str, emit) -> None:
         kvs.append(f"WHISPER_CONCURRENCY={int(req.concurrency)}")
     if req.transcribe_enabled is not None:
         kvs.append(f"WHISPER_TRANSCRIBE={'1' if req.transcribe_enabled else '0'}")
+    if req.audio_only is not None:
+        kvs.append(f"WHISPER_AUDIO_ONLY={'1' if req.audio_only else '0'}")
     if req.model:
         kvs.append(f"WHISPER_MODEL={req.model}")
     if req.vad is not None:
@@ -4016,6 +4028,36 @@ async def storage_install_untrunc(sid: str):
                              creds.get("auth_method") or "key",
                              _decrypt_pw(creds.get("password_enc")),
                              creds.get("key_path"), emit)
+
+    return _threaded_stream(work)
+
+
+class AudioOnlyIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/storage/{sid}/audio-only", dependencies=[Depends(require_login)])
+async def storage_audio_only(sid: str, body: AudioOnlyIn):
+    """One-click: set WHISPER_AUDIO_ONLY on a storage box (saved SSH creds) so it
+    stops auto-scanning MP4s and transcribes only audio pushed by the control plane."""
+    s = _storage_by_id(sid)
+    if not s:
+        raise HTTPException(404, "storage server not found")
+    host, port = _ssh_target(s)
+    creds = _get_creds_mkey(host, port) if host else None
+
+    def work(emit):
+        if not (creds and (creds.get("password_enc") or creds.get("key_path"))):
+            emit(f"No saved SSH credentials for {host}:{port}. Run a Push update for "
+                 "this server once, then this is one click.\n")
+            return
+        req = WorkerConfigRequest(
+            audio_only=body.enabled,
+            ssh_port=port, ssh_user=creds.get("ssh_user") or "root",
+            auth_method=creds.get("auth_method") or "key",
+            ssh_password=_decrypt_pw(creds.get("password_enc")),
+            ssh_key_path=creds.get("key_path"))
+        _ssh_worker_config(req, host, emit)
 
     return _threaded_stream(work)
 
@@ -4386,6 +4428,26 @@ async def audio_transcribe_status():
     return {"enabled": settings.transcribe_from_audio,
             "interval_sec": settings.audio_interval,
             "in_flight": len(_audio_inflight)}
+
+
+class AudioConfigIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/audio-transcribe/config", dependencies=[Depends(require_login)])
+async def audio_transcribe_config(body: AudioConfigIn):
+    """Turn audio-first transcription on/off at runtime (persisted). When on, the
+    control plane ships small audio tracks instead of relying on the storage box
+    auto-scanning full MP4s — remember to flip each storage box to audio-only too."""
+    settings.transcribe_from_audio = body.enabled
+    async with _db_lock:
+        db.execute(
+            "INSERT INTO config(key,value,updated_at) VALUES('transcribe_from_audio',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            ("1" if body.enabled else "0", time.time()))
+        db.commit()
+    log.info("audio-first transcription %s via UI", "ENABLED" if body.enabled else "disabled")
+    return {"enabled": settings.transcribe_from_audio}
 
 
 @app.post("/api/audio-transcribe/run-now", dependencies=[Depends(require_login)])
