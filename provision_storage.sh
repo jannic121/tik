@@ -140,6 +140,10 @@ WHISPER_BEAM_SIZE=5
 # Set to 0 to make this a storage-only server (receives/serves/moves files but
 # does not transcribe). Useful when another server handles transcription.
 WHISPER_TRANSCRIBE=1
+# Audio-first mode: set to 1 when the control plane runs TRANSCRIBE_FROM_AUDIO=1.
+# The box then transcribes ONLY small audio tracks pushed to PUT /audio and never
+# auto-scans MP4s — the full video bypasses this box and goes straight to cloud.
+WHISPER_AUDIO_ONLY=0
 # Flag a file as "stalled" in the dashboard after this many seconds with no progress.
 WHISPER_STALL_SEC=180
 # Hard-kill a transcription after this many seconds (0 = auto: 10x audio length + 5m).

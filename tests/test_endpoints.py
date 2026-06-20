@@ -74,6 +74,7 @@ def test_core_get_endpoints_ok():
         "/api/storage-capacity", "/api/update-status",
         "/api/alerts/config",
         "/api/transcript-index/status", "/api/chat-index/status",
+        "/api/audio-transcribe/status",
         "/api/transcript-search?q=hello", "/api/chat/search?q=hello",
         "/api/chat/files",
     ):
@@ -165,6 +166,19 @@ def test_migrate_unknown_target_404():
     cp.db.commit()
     r = _c.post("/api/watchers/migme/migrate", json={"backend_pk": "does-not-exist"})
     assert r.status_code == 404, r.text
+
+
+# ---- audio-first transcription -------------------------------------------
+
+def test_audio_transcribe_status_shape():
+    d = _c.get("/api/audio-transcribe/status").json()
+    assert "enabled" in d and "in_flight" in d and "interval_sec" in d
+
+
+def test_audio_transcribe_run_now_409_when_disabled():
+    # Default config has TRANSCRIBE_FROM_AUDIO unset → disabled → 409, not a crash.
+    r = _c.post("/api/audio-transcribe/run-now")
+    assert r.status_code == 409, r.text
 
 
 # ---- catalog cutover -----------------------------------------------------

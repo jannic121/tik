@@ -122,6 +122,12 @@ class Settings:
     # worker now empties the backlog each cycle instead of shipping one file per
     # interval (which capped throughput at ~one file / UPLOAD_INTERVAL_SEC).
     upload_concurrency: int = max(1, int(os.environ.get("UPLOAD_CONCURRENCY", "2")))
+    # Audio-first transcription (the rebuilt pipeline). When 1, the control plane
+    # pulls a small extracted audio track off each recorder and ships only that to
+    # a transcription server — the full video never transits the transcription box.
+    # Storage boxes should run WHISPER_AUDIO_ONLY=1 so they don't also auto-scan.
+    transcribe_from_audio: bool = os.environ.get("TRANSCRIBE_FROM_AUDIO", "0") == "1"
+    audio_interval: int     = int(os.environ.get("AUDIO_TRANSCRIBE_INTERVAL_SEC", "120"))
     # Shared secret recorders must present on POST /events. Empty => webhook
     # stays open (preserves prior behaviour). To enable: set the SAME value as
     # CONTROL_PLANE_TOKEN on every recorder FIRST, then here, so no event is
@@ -1541,6 +1547,146 @@ async def _transcript_index_loop() -> None:
         await asyncio.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Audio-first transcription orchestration (the rebuilt pipeline).
+#
+# Instead of shipping the whole MP4 to the transcription box, the control plane
+# asks each recorder to extract a small audio track (GET /files/audio) and ships
+# only that to a transcription server (PUT /audio). The full video takes the
+# separate archive path and never transits the transcription box.
+
+_audio_inflight: dict[str, float] = {}   # filename → ts last shipped (de-dupe)
+_AUDIO_INFLIGHT_TTL = 1800               # retry a recording's audio after 30 min
+
+
+async def _relay_audio(backend: dict, fname: str, creator: str,
+                       target: dict) -> bool:
+    """GET an extracted audio track off a recorder and PUT it to a transcriber.
+    Audio is small, so it buffers fully through a local temp file. The audio's
+    real filename (Opus or the WAV fallback) comes back in Content-Disposition so
+    the destination stem lines up with the recording."""
+    src_url = f"{backend['url'].rstrip('/')}/files/audio"
+    tmp = Path(tempfile.gettempdir()) / f"ttaudio_{uuid.uuid4().hex}.part"
+    try:
+        audio_name = Path(fname).with_suffix(".ogg").name
+        async with httpx.AsyncClient(timeout=None) as cli:
+            async with cli.stream(
+                "GET", src_url,
+                headers={"Authorization": f"Bearer {backend['auth_token']}"},
+                params={"name": fname},
+            ) as resp:
+                if resp.status_code != 200:
+                    # 422 = nothing decodable (dead recording); other codes are
+                    # transient. Caller records the attempt either way and backs off.
+                    return False
+                m = re.search(r'filename="?([^"\r\n]+)"?',
+                              resp.headers.get("content-disposition", ""))
+                if m:
+                    audio_name = Path(m.group(1)).name
+                with tmp.open("wb") as f:
+                    async for chunk in resp.aiter_bytes(1 << 20):
+                        f.write(chunk)
+
+        async def _chunks(path):
+            with open(path, "rb") as fh:
+                while True:
+                    b = fh.read(1 << 20)
+                    if not b:
+                        break
+                    yield b
+
+        dst = f"{target['url'].rstrip('/')}/audio/{creator}/{audio_name}"
+        hdrs = {"Content-Type": "application/octet-stream"}
+        if target.get("token"):
+            hdrs["Authorization"] = f"Bearer {target['token']}"
+        async with httpx.AsyncClient(timeout=None) as up:
+            put = await up.put(dst, headers=hdrs, content=_chunks(tmp))
+        return put.status_code in (200, 201, 202)
+    except Exception:
+        log.debug("audio relay failed for %s", fname, exc_info=True)
+        return False
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _audio_transcribe_cycle(batch: int = 4) -> dict:
+    """Ship audio for recordings that still need a transcript. One pass."""
+    if not settings.transcribe_from_audio:
+        return {"pushed": 0}
+    servers = _storage_healthy()
+    if not servers:
+        return {"pushed": 0}
+
+    # Prune expired in-flight markers so failed/lost pushes get retried.
+    now = time.time()
+    for fn in [k for k, ts in _audio_inflight.items()
+               if now - ts > _AUDIO_INFLIGHT_TTL]:
+        _audio_inflight.pop(fn, None)
+
+    # What's already transcribed or in flight on any transcriber?
+    busy: set[str] = set()
+    for s in servers:
+        code, body = await _tw_call(s, "GET", "/transcripts/all-statuses")
+        if code == 200 and isinstance(body, dict):
+            for fn, st in body.items():
+                if st in ("done", "processing", "pending"):
+                    busy.add(fn)
+
+    async with _db_lock:
+        backends = db.execute(
+            "SELECT id, backend_id, url, auth_token FROM backends "
+            "WHERE last_health_ok=1"
+        ).fetchall()
+
+    pushed = 0
+    for b in backends:
+        if pushed >= batch:
+            break
+        code, files = await _call(b["url"], b["auth_token"], "GET", "/files")
+        if code != 200 or not isinstance(files, dict):
+            continue
+        for creator, infos in files.items():
+            if pushed >= batch:
+                break
+            for fi in infos:
+                if pushed >= batch:
+                    break
+                fname = Path(fi.get("path", "")).name
+                if not fname.endswith(".mp4") or fname.endswith("_flv.mp4"):
+                    continue
+                if fname in busy or fname in _audio_inflight:
+                    continue
+                # Give a just-finished recording a moment to settle on disk.
+                if now - (fi.get("mtime") or 0) < settings.upload_min_age:
+                    continue
+                target = _pick_storage()
+                if not target:
+                    break
+                ok = await _relay_audio(dict(b), fname, creator, target)
+                # Mark in-flight on any attempt so we don't hammer a dead file;
+                # the TTL lets a transient failure retry later.
+                _audio_inflight[fname] = time.time()
+                if ok:
+                    pushed += 1
+    return {"pushed": pushed}
+
+
+async def _audio_transcribe_loop() -> None:
+    """Background driver for audio-first transcription (no-op unless enabled)."""
+    while True:
+        try:
+            if settings.transcribe_from_audio:
+                res = await _audio_transcribe_cycle()
+                if res["pushed"]:
+                    log.info("audio-first: shipped %d audio track(s)", res["pushed"])
+        except Exception:
+            log.debug("audio transcribe loop error (ignored)", exc_info=True)
+        await asyncio.sleep(settings.audio_interval)
+
+
 async def _chat_index_cycle(batch: int = 30) -> dict:
     """Catalog the chat logs on storage: upsert each log's metadata (recomputing its
     fuzzy recording match every pass, since recordings may be cataloged later) and
@@ -1776,6 +1922,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_move_cycle(), name="move-worker")
     asyncio.create_task(_maintenance_worker(), name="maintenance")
     asyncio.create_task(_alert_loop(), name="alerts")
+    asyncio.create_task(_audio_transcribe_loop(), name="audio-transcribe")
+    if settings.transcribe_from_audio:
+        log.info("audio-first transcription ENABLED "
+                 "(recorders extract audio; full video bypasses the transcription box)")
     if CATALOG_ENABLED:
         global _catalog
         try:
@@ -4227,6 +4377,24 @@ async def transcript_index_run_now():
     if _catalog is None:
         raise HTTPException(404, "catalog is off (set CATALOG_ENABLED=1)")
     return await _transcript_index_cycle()
+
+
+@app.get("/api/audio-transcribe/status", dependencies=[Depends(require_login)])
+async def audio_transcribe_status():
+    """Audio-first transcription state: enabled flag + how many tracks are in
+    flight (shipped, transcript not yet observed)."""
+    return {"enabled": settings.transcribe_from_audio,
+            "interval_sec": settings.audio_interval,
+            "in_flight": len(_audio_inflight)}
+
+
+@app.post("/api/audio-transcribe/run-now", dependencies=[Depends(require_login)])
+async def audio_transcribe_run_now():
+    """Ship a batch of audio tracks for transcription immediately."""
+    if not settings.transcribe_from_audio:
+        raise HTTPException(409, "audio-first transcription is off "
+                                 "(set TRANSCRIBE_FROM_AUDIO=1)")
+    return await _audio_transcribe_cycle()
 
 
 @app.post("/api/transcript-index/rebuild", dependencies=[Depends(require_login)])

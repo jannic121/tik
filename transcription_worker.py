@@ -93,6 +93,11 @@ class Settings:
     # designate a box as pure storage (e.g. the recorder ships finished files to
     # a different, transcription-enabled server).
     transcribe_enabled: bool = os.environ.get("WHISPER_TRANSCRIBE", "1") != "0"
+    # Audio-first mode: when WHISPER_AUDIO_ONLY=1 the directory scanner does NOT
+    # auto-transcribe MP4s. Transcription happens only via PUT /audio (the control
+    # plane extracts a small audio track on the recorder and ships that), so the
+    # box never needs the full video. The big file goes straight to cloud archive.
+    audio_only: bool      = os.environ.get("WHISPER_AUDIO_ONLY", "0") == "1"
     # Voice-activity detection skips silent stretches before transcribing — a big
     # speed win on lives with lots of dead air. On by default; tunable threshold.
     vad: bool             = os.environ.get("WHISPER_VAD", "1") != "0"
@@ -631,10 +636,27 @@ class TranscriptionWorker:
 
     # ── queue management ─────────────────────────────────────────────────────
 
+    def enqueue_audio(self, audio: Path) -> bool:
+        """Queue an already-extracted audio file (the audio-first path). The stem
+        matches the original recording, so outputs land under the right name.
+        Returns False if it's already queued/in-flight or already transcribed."""
+        if not settings.transcribe_enabled:
+            return False
+        fname = audio.name
+        if fname in self._active or fname in self._pending:
+            return False
+        if self._txt(audio).exists():
+            return False
+        self._pending.add(fname)
+        self._queue.put_nowait(audio)
+        return True
+
     def scan(self) -> int:
         """Find MP4s without a .txt and enqueue them. Returns count newly queued."""
         if not settings.transcribe_enabled:
             return 0          # storage-only mode: never enqueue for transcription
+        if settings.audio_only:
+            return 0          # audio-first mode: only PUT /audio drives transcription
         if not settings.watch_dir.exists():
             return 0
         open_files = _open_files()      # files a recorder still has open (colocated)
@@ -1152,6 +1174,11 @@ class TranscriptionWorker:
                     os.unlink(errf.name)
                 except OSError:
                     pass
+                # Audio-first: the extracted audio was only a transcription input —
+                # the transcript is what we keep. Drop it once we're done with it
+                # (whether it succeeded or gave up) so it doesn't accumulate.
+                if mp4.suffix.lower() in (".ogg", ".wav", ".m4a", ".mp3"):
+                    mp4.unlink(missing_ok=True)
                 self._active.pop(fname, None)
                 self._processing = next(iter(self._active), None)
                 self._queue.task_done()
@@ -1192,8 +1219,22 @@ class TranscriptionWorker:
             return p
         return None
 
+    def _find_txt(self, filename: str) -> Path | None:
+        """Locate the .txt transcript for a recording filename. Works even when the
+        MP4 itself is gone (audio-first: video archived to cloud, only the .txt is
+        local). `filename` is the original recording name (e.g. <stem>.mp4)."""
+        txt_name = Path(filename).with_suffix(".txt").name
+        for p in settings.watch_dir.rglob(txt_name):
+            return p
+        return None
+
     def all_statuses(self) -> dict[str, str]:
-        """Return {filename: status} for every MP4 known to the worker."""
+        """Return {filename: status} keyed by the original recording (MP4) name.
+
+        Includes recordings transcribed audio-first, where only the .txt is on
+        this box and the video lives in cloud archive — those are reported under
+        their <stem>.mp4 name so the control-plane indexer finds them all the same.
+        """
         statuses: dict[str, str] = {}
         if not settings.watch_dir.exists():
             return statuses
@@ -1206,6 +1247,10 @@ class TranscriptionWorker:
             elif fname in self._pending:
                 statuses[fname] = "pending"
             # omit "none" — callers treat missing key as "none"
+        # Audio-first transcripts: a .txt whose .mp4 was never sent here.
+        for txt in settings.watch_dir.rglob("*.txt"):
+            mp4_name = txt.with_suffix(".mp4").name
+            statuses.setdefault(mp4_name, "done")
         return statuses
 
     def _throughput(self) -> dict:
@@ -1239,6 +1284,7 @@ class TranscriptionWorker:
             "current_file":      self._processing,
             "concurrency":       settings.concurrency,
             "transcribe_enabled": settings.transcribe_enabled,
+            "audio_only":        settings.audio_only,
             "vad":               settings.vad,
             "beam_size":         settings.beam_size,
             "active":            [dict(a) for a in self._active.values()],
@@ -1735,12 +1781,11 @@ async def salvaged_list():
 @app.get("/transcripts/view", dependencies=[Depends(require_auth)],
          response_class=PlainTextResponse)
 async def view_transcript(filename: str = Query(...)):
-    """Return the timestamped .txt transcript for a given MP4 filename."""
-    mp4 = worker._find_mp4(filename)
-    if not mp4:
-        raise HTTPException(404, f"MP4 not found in watch dir: {filename}")
-    txt = worker._txt(mp4)
-    if not txt.exists():
+    """Return the timestamped .txt transcript for a given recording filename.
+    Resolves the transcript directly, so it works whether or not the source MP4
+    is still on this box (audio-first leaves only the .txt)."""
+    txt = worker._find_txt(filename)
+    if not txt or not txt.exists():
         raise HTTPException(404, "transcript not yet available")
     return txt.read_text(encoding="utf-8")
 
@@ -1750,11 +1795,8 @@ async def view_transcript(filename: str = Query(...)):
 async def download_srt(filename: str = Query(...)):
     """Download the timestamped transcript as a .txt file.
     (Endpoint name kept for control-plane compatibility; only .txt is produced now.)"""
-    mp4 = worker._find_mp4(filename)
-    if not mp4:
-        raise HTTPException(404, f"MP4 not found: {filename}")
-    txt = worker._txt(mp4)
-    if not txt.exists():
+    txt = worker._find_txt(filename)
+    if not txt or not txt.exists():
         raise HTTPException(404, "transcript not yet available")
     dl_name = filename.replace(".mp4", "_transcript.txt")
     return PlainTextResponse(
@@ -2078,6 +2120,53 @@ async def receive_file(username: str, filename: str, request: Request):
 
     log.info("received %s/%s (%s bytes)", username, filename, f"{written:,}")
     return {"filename": filename, "path": str(dest_path), "size_bytes": written}
+
+
+@app.put("/audio/{username}/{filename}", dependencies=[Depends(require_auth)])
+async def receive_audio(username: str, filename: str, request: Request):
+    """Audio-first transcription: receive a small extracted audio track (the
+    control plane pulls it off the recorder) and queue it for transcription. The
+    full video never reaches this box. `filename` is the audio name, whose stem
+    matches the original recording, so the resulting <stem>.txt/.srt/.json line up
+    with the recording exactly as if the MP4 had been transcribed here."""
+    if not (filename.endswith(".ogg") or filename.endswith(".wav")
+            or filename.endswith(".m4a") or filename.endswith(".mp3")):
+        raise HTTPException(400, "only .ogg/.wav/.m4a/.mp3 audio accepted")
+    for seg in (username, filename):
+        if "/" in seg or "\\" in seg or seg in ("..", ".") or seg.startswith(".."):
+            raise HTTPException(400, "invalid path segment")
+    if not settings.transcribe_enabled:
+        raise HTTPException(409, "transcription disabled on this server")
+    dest_dir = settings.watch_dir / username
+    try:
+        dest_dir.resolve().relative_to(settings.watch_dir.resolve())
+    except ValueError:
+        raise HTTPException(400, "path outside watch dir")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / filename
+    tmp_path  = dest_dir / f".{filename}.tmp"
+
+    # If a transcript already exists for this recording, don't re-queue.
+    if dest_path.with_suffix(".txt").exists():
+        return {"filename": filename, "status": "already-transcribed"}
+
+    written = 0
+    try:
+        with tmp_path.open("wb") as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+                written += len(chunk)
+        tmp_path.rename(dest_path)
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"write failed: {e}")
+
+    queued = worker.enqueue_audio(dest_path)
+    log.info("received audio %s/%s (%s bytes) — %s",
+             username, filename, f"{written:,}",
+             "queued" if queued else "already in flight")
+    return {"filename": filename, "path": str(dest_path),
+            "size_bytes": written, "queued": queued}
 
 
 # ---------------------------------------------------------------------------

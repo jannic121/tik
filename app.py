@@ -38,6 +38,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from watcher import WatcherConfig, WatcherEvent, WatcherProcess
 
@@ -871,6 +872,64 @@ async def download_file(path: str):
         filename=target.name,
         media_type="video/mp4",
         headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+    )
+
+
+async def _extract_audio(src: Path) -> Optional[Path]:
+    """Pull a small 16 kHz mono audio track out of a recording for transcription.
+
+    Tolerant of corrupt/interrupted recordings (skip bad packets) — this is where
+    most salvage now happens, on the recorder, so the big video never has to reach
+    the transcription box. Prefers Opus (~7 MB/hour); falls back to PCM WAV if the
+    ffmpeg build lacks libopus. Returns the audio path in a fresh temp dir, or None
+    if nothing decodable came out. The source video is never modified."""
+    if shutil.which("ffmpeg") is None:
+        return None
+    d = Path(tempfile.mkdtemp(prefix="tt-audio-"))
+    tolerant = ["-err_detect", "ignore_err", "-fflags", "+discardcorrupt+genpts"]
+    attempts = [
+        (d / (src.stem + ".ogg"), ["-c:a", "libopus", "-b:a", "16k"]),
+        (d / (src.stem + ".wav"), ["-c:a", "pcm_s16le"]),    # universal fallback
+    ]
+    for out, codec in attempts:
+        cmd = ["ffmpeg", "-nostdin", "-y", *tolerant, "-i", str(src),
+               "-vn", "-ac", "1", "-ar", "16000", *codec, str(out)]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=3600)
+        except Exception:
+            try: proc.kill()  # type: ignore[union-attr]
+            except Exception: pass
+        if out.exists() and out.stat().st_size > 256:
+            return out
+        out.unlink(missing_ok=True)
+    shutil.rmtree(d, ignore_errors=True)
+    return None
+
+
+@app.get("/files/audio", dependencies=[Depends(require_auth)])
+async def extract_audio(name: str):
+    """Return a small extracted audio track for a recording, so the transcription
+    server can transcribe without ever receiving the full video. `name` is a bare
+    recording filename (e.g. TK_user_2026.06.20_18-00-00.mp4); the file is located
+    under RECORDINGS_ROOT. The response is cleaned up after it is streamed."""
+    safe = Path(name).name
+    if safe != name or not safe.endswith(".mp4"):
+        raise HTTPException(400, "name must be a bare .mp4 filename")
+    root = settings.recordings_root.resolve()
+    src = next((p for p in root.rglob(safe) if p.is_file()), None)
+    if not src:
+        raise HTTPException(404, "recording not found")
+    audio = await _extract_audio(src)
+    if not audio:
+        raise HTTPException(
+            422, "no decodable audio (recording may be unrecoverable or ffmpeg missing)")
+    media = "audio/ogg" if audio.suffix == ".ogg" else "audio/wav"
+    return FileResponse(
+        audio, filename=audio.name, media_type=media,
+        background=BackgroundTask(lambda: shutil.rmtree(audio.parent, ignore_errors=True)),
     )
 
 
