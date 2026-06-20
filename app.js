@@ -649,6 +649,46 @@ function renderFiles(){
   updateBulkBar();
 }
 
+// ── Alerts / notifications ───────────────────────────────────────
+function _alChannelHint(){
+  const ch=$('al-channel').value, h=$('al-hint');
+  h.textContent = ch==='ntfy' ? 'Your ntfy topic URL, e.g. https://ntfy.sh/tt-recorder-abc123'
+    : ch==='slack' ? 'A Slack incoming-webhook URL (https://hooks.slack.com/services/…)'
+    : 'Any endpoint; receives POST {title, message, level}.';
+}
+async function openAlerts(){
+  _alChannelHint();
+  try{ const r=await api('/api/alerts/config'); if(r&&r.ok){ const c=await r.json();
+    $('al-enabled').checked=!!c.enabled; $('al-channel').value=c.channel||'webhook'; $('al-url').value=c.url||'';
+    $('al-diskpct').value=c.disk_pct??90; $('al-ttf').value=c.hours_to_full??12;
+    $('al-disk').checked=c.alert_disk!==false; $('al-unreach').checked=c.alert_unreachable!==false;
+    $('al-watcher').checked=c.alert_watcher!==false; $('al-trans').checked=c.alert_transcription!==false;
+    $('al-archive').checked=c.alert_archive!==false; _alChannelHint(); }
+  }catch(_){}
+  $('al-out').style.display='none'; $('al-out').textContent='';
+  openModal('modal-alerts');
+}
+function _alBody(){
+  return { enabled:$('al-enabled').checked, channel:$('al-channel').value, url:$('al-url').value.trim(),
+    disk_pct:parseFloat($('al-diskpct').value||'90'), hours_to_full:parseFloat($('al-ttf').value||'12'),
+    alert_disk:$('al-disk').checked, alert_unreachable:$('al-unreach').checked,
+    alert_watcher:$('al-watcher').checked, alert_transcription:$('al-trans').checked,
+    alert_archive:$('al-archive').checked };
+}
+async function saveAlerts(){
+  const r=await api('/api/alerts/config',{method:'POST',body:JSON.stringify(_alBody())});
+  const out=$('al-out'); out.style.display='';
+  out.textContent = (r&&r.ok) ? 'Saved.' : 'Save failed.';
+  if(r&&r.ok) setTimeout(()=>closeModal('modal-alerts'),700);
+}
+async function testAlert(){
+  const out=$('al-out'); out.style.display=''; out.textContent='Sending test…';
+  try{ const r=await api('/api/alerts/test',{method:'POST',body:JSON.stringify(_alBody())});
+    const d=r?await r.json():null;
+    out.textContent = d&&d.ok ? '✓ Sent — check your device. ('+d.detail+')' : '✗ Failed: '+(d?d.detail:'no response');
+  }catch(e){ out.textContent='✗ '+e.message; }
+}
+
 // ── In-browser playback with synced transcript + chat timeline ───
 let _playerItems = [];
 async function openPlayer(fname, username, dlUrl, hasTranscript, chatFile){

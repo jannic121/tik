@@ -1547,6 +1547,137 @@ async def _chat_index_loop() -> None:
         await asyncio.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Alerts / notifications (opt-in). Fires to a webhook / ntfy / Slack when a disk
+# fills, a node goes unreachable, a watcher errors, or transcription/archive fails.
+
+_alert_state: dict[str, float] = {}     # condition key -> last time we notified
+
+
+def _get_alert_cfg() -> dict:
+    try:
+        row = db.execute("SELECT value FROM config WHERE key='alerts'").fetchone()
+        return json.loads(row["value"]) if row and row["value"] else {}
+    except Exception:
+        return {}
+
+
+def _set_alert_cfg(cfg: dict) -> None:
+    db.execute(
+        "INSERT INTO config(key,value,updated_at) VALUES('alerts',?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (json.dumps(cfg), time.time()))
+    db.commit()
+
+
+async def _send_alert(cfg: dict, title: str, message: str, level: str = "warning") -> tuple:
+    """Dispatch one notification to the configured channel. Returns (ok, detail)."""
+    channel, url = cfg.get("channel", "webhook"), (cfg.get("url") or "").strip()
+    if not url:
+        return False, "no url"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            if channel == "ntfy":
+                prio = "urgent" if level == "critical" else "high" if level == "warning" else "default"
+                r = await client.post(url, content=message.encode("utf-8"),
+                                      headers={"Title": title, "Priority": prio, "Tags": "warning"})
+            elif channel == "slack":
+                r = await client.post(url, json={"text": f"*{title}*\n{message}"})
+            else:   # generic webhook
+                r = await client.post(url, json={"title": title, "message": message, "level": level})
+        return (r.status_code < 300), f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+async def _evaluate_alerts(cfg: dict, cooldown: int) -> None:
+    """Build the set of currently-active alert conditions, then notify on each new
+    one (and re-notify after the cooldown). Sends a 'resolved' note when a prior
+    condition clears."""
+    now = time.time()
+    disk_pct = float(cfg.get("disk_pct", 90))
+    ttf_hours = float(cfg.get("hours_to_full", 12))
+    active: dict[str, tuple] = {}        # key -> (title, message, level)
+
+    async with _db_lock:
+        stos = db.execute("SELECT id, label, url, token, last_health_ok FROM storage_servers").fetchall()
+        recs = db.execute("SELECT id, backend_id, url, auth_token, last_health_ok FROM backends").fetchall()
+
+    for s in stos:
+        label = s["label"] or s["url"]
+        code, st = await _tw_call(dict(s), "GET", "/status")
+        if code != 200 or not isinstance(st, dict):
+            if cfg.get("alert_unreachable", True):
+                active[f"down:s:{s['id']}"] = (f"Storage offline: {label}",
+                    f"{label} is not responding to /status.", "critical")
+            continue
+        free, total = st.get("disk_free_bytes"), st.get("disk_total_bytes")
+        if cfg.get("alert_disk", True) and free is not None and total:
+            used = 100 * (1 - free / total)
+            if used >= disk_pct:
+                active[f"disk:{s['id']}"] = (f"Disk {used:.0f}% on {label}",
+                    f"{label} disk is {used:.0f}% full ({_fmt_bytes(free)} free).", "critical")
+        if cfg.get("alert_transcription", True) and (st.get("gave_up") or 0) > 0:
+            active[f"tr:{s['id']}"] = (f"Transcription failures on {label}",
+                f"{st['gave_up']} recording(s) gave up transcribing on {label}.", "warning")
+        if cfg.get("alert_archive", True) and (st.get("archive_failed_count") or 0) > 0:
+            active[f"ar:{s['id']}"] = (f"Archive failures on {label}",
+                f"{st['archive_failed_count']} file(s) failing to archive on {label}.", "warning")
+    # time-to-full from sampled history
+    if cfg.get("alert_disk", True):
+        try:
+            cap = (await storage_capacity())["servers"]
+            for s in cap:
+                if s.get("hours_to_full") is not None and s["hours_to_full"] <= ttf_hours:
+                    active[f"ttf:{s['id']}"] = (f"Disk filling fast: {s['label']}",
+                        f"{s['label']} projected full in ~{s['hours_to_full']:.0f}h.", "critical")
+        except Exception:
+            pass
+
+    for b in recs:
+        if cfg.get("alert_unreachable", True) and not b["last_health_ok"]:
+            code, _ = await _call(b["url"], b["auth_token"], "GET", "/health")
+            if code != 200:
+                active[f"down:b:{b['id']}"] = (f"Recorder offline: {b['backend_id']}",
+                    f"Recorder {b['backend_id']} is not responding.", "critical")
+    if cfg.get("alert_watcher", True):
+        for b in recs:
+            if not b["last_health_ok"]:
+                continue
+            code, body = await _call(b["url"], b["auth_token"], "GET", "/watchers")
+            if code == 200 and isinstance(body, list):
+                for w in body:
+                    if (w.get("state") or w.get("status")) == "error":
+                        u = w.get("username", "?")
+                        active[f"watch:{b['id']}:{u}"] = (f"Watcher error: {u}",
+                            f"Watcher {u} on {b['backend_id']} is in the error state.", "warning")
+
+    # Notify new / cooldown-expired conditions; resolve cleared ones.
+    for key, (title, msg, level) in active.items():
+        last = _alert_state.get(key)
+        if last is None or (now - last) >= cooldown:
+            ok, _ = await _send_alert(cfg, title, msg, level)
+            if ok:
+                _alert_state[key] = now
+    for key in list(_alert_state.keys()):
+        if key not in active:
+            await _send_alert(cfg, "Resolved", f"Condition cleared: {key}", "info")
+            _alert_state.pop(key, None)
+
+
+async def _alert_loop() -> None:
+    interval = int(os.environ.get("ALERT_INTERVAL_SEC", "300"))
+    cooldown = int(os.environ.get("ALERT_COOLDOWN_SEC", str(6 * 3600)))
+    while True:
+        try:
+            cfg = _get_alert_cfg()
+            if cfg.get("enabled") and cfg.get("url"):
+                await _evaluate_alerts(cfg, cooldown)
+        except Exception:
+            log.debug("alert loop error (ignored)", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO,
@@ -1585,6 +1716,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_auto_backup_worker(), name="auto-backup")
     asyncio.create_task(_move_cycle(), name="move-worker")
     asyncio.create_task(_maintenance_worker(), name="maintenance")
+    asyncio.create_task(_alert_loop(), name="alerts")
     if CATALOG_ENABLED:
         global _catalog
         try:
@@ -3537,6 +3669,40 @@ async def storage_archive_test(sid: str, req: dict):
         host, req.get("ssh_port", 22), req.get("ssh_user", "root"),
         req.get("auth_method", "key"), req.get("ssh_password"), req.get("ssh_key_path"))
     return _threaded_stream(lambda emit: _ssh_archive_test(host, req, emit))
+
+
+class AlertConfig(BaseModel):
+    enabled: bool = False
+    channel: str = Field("webhook", pattern="^(webhook|ntfy|slack)$")
+    url: str = ""
+    disk_pct: float = Field(90, ge=1, le=100)
+    hours_to_full: float = Field(12, ge=0)
+    alert_disk: bool = True
+    alert_unreachable: bool = True
+    alert_watcher: bool = True
+    alert_transcription: bool = True
+    alert_archive: bool = True
+
+
+@app.get("/api/alerts/config", dependencies=[Depends(require_login)])
+async def get_alerts_config():
+    cfg = _get_alert_cfg()
+    return {**AlertConfig().model_dump(), **cfg}
+
+
+@app.post("/api/alerts/config", dependencies=[Depends(require_login)])
+async def set_alerts_config(cfg: AlertConfig):
+    async with _db_lock:
+        _set_alert_cfg(cfg.model_dump())
+    return {"ok": True}
+
+
+@app.post("/api/alerts/test", dependencies=[Depends(require_login)])
+async def test_alert(cfg: AlertConfig):
+    ok, detail = await _send_alert(cfg.model_dump(),
+                                   "TT Recorder test alert",
+                                   "If you can read this, notifications are wired up. 🎉", "info")
+    return {"ok": ok, "detail": detail}
 
 
 @app.get("/api/storage-capacity", dependencies=[Depends(require_login)])

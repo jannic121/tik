@@ -159,6 +159,7 @@
       <button class="ghost" onclick="toggleBreakdown(this)" title="Show usage per server and per creator">📊 Usage breakdown</button>
       <button class="ghost" onclick="toggleMoves(this)" title="Move recordings between storage servers">↔ Moves</button>
       <button class="ghost" onclick="downloadBackup(this)" title="Download a snapshot of the control-plane database">⬇ Backup DB</button>
+      <button class="ghost" onclick="openAlerts()" title="Get notified when a disk fills, a node goes down, or a job fails">🔔 Alerts</button>
       <button class="ghost" onclick="loadStorage()">Refresh</button>
   </div>
   <div id="storage-breakdown" style="display:none;margin-bottom:16px;"></div>
@@ -806,6 +807,39 @@
       <button class="cancel" onclick="closeModal('modal-evict')">Cancel</button>
       <button class="ghost" id="evict-now-btn" onclick="evictNow()" title="Run the eviction sweep right now">Evict now</button>
       <button class="primary" id="evict-apply" onclick="applyEviction()">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Alerts modal ===== -->
+<div class="modal-bg" id="modal-alerts">
+  <div class="modal">
+    <h3>Notifications</h3>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+      <input type="checkbox" id="al-enabled" style="width:auto;"/> Enable notifications
+    </label>
+    <label style="margin-top:10px;">Channel
+      <select id="al-channel" onchange="_alChannelHint()">
+        <option value="webhook">Generic webhook (JSON POST)</option>
+        <option value="ntfy">ntfy</option>
+        <option value="slack">Slack incoming webhook</option>
+      </select>
+    </label>
+    <label>URL <input id="al-url" placeholder="https://ntfy.sh/my-topic"/></label>
+    <p id="al-hint" class="dim" style="font-size:11px;margin:-4px 0 8px;"></p>
+    <h4>Alert me when…</h4>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="al-disk" style="width:auto;"/> a disk goes above
+      <input id="al-diskpct" type="number" min="1" max="100" value="90" style="width:60px;"/> % &nbsp;or fills within
+      <input id="al-ttf" type="number" min="0" value="12" style="width:56px;"/> h</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:6px;"><input type="checkbox" id="al-unreach" style="width:auto;"/> a recorder or storage server is unreachable</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="al-watcher" style="width:auto;"/> a watcher enters the error state</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="al-trans" style="width:auto;"/> transcription gives up on a recording</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="al-archive" style="width:auto;"/> cloud archiving repeatedly fails</label>
+    <pre id="al-out" style="display:none;background:#111;border:1px solid #2a2a2a;border-radius:6px;padding:8px;margin-top:10px;font-size:12px;white-space:pre-wrap;"></pre>
+    <div class="btn-row">
+      <button class="cancel" onclick="closeModal('modal-alerts')">Cancel</button>
+      <button class="ghost" onclick="testAlert()">Send test</button>
+      <button class="primary" onclick="saveAlerts()">Save</button>
     </div>
   </div>
 </div>
