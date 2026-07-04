@@ -1,0 +1,392 @@
+<title>TikTok Live Recorder — Spec</title>
+<style>
+  :root{
+    --bg:#f5f7f7; --surface:#ffffff; --surface-2:#eef1f2;
+    --ink:#15191c; --muted:#5b656d; --faint:#8a949c; --line:#e0e5e7;
+    --accent:#0f8f86; --accent-ink:#0b6a63; --accent-wash:#e5f2f0;
+    --rec:#c93a55; --arc:#3268cf; --txt:#2c9457; --warn:#b07a10;
+    --shadow:0 1px 2px rgba(16,25,30,.05),0 8px 30px rgba(16,25,30,.06);
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0d1012; --surface:#14181b; --surface-2:#191e21;
+      --ink:#e6ecee; --muted:#96a2ab; --faint:#68757d; --line:#242b2f;
+      --accent:#3fd0c3; --accent-ink:#8fe6dc; --accent-wash:#11302d;
+      --rec:#f0728a; --arc:#7aa6f0; --txt:#5ac488; --warn:#e0af4a;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f5f7f7; --surface:#ffffff; --surface-2:#eef1f2;
+    --ink:#15191c; --muted:#5b656d; --faint:#8a949c; --line:#e0e5e7;
+    --accent:#0f8f86; --accent-ink:#0b6a63; --accent-wash:#e5f2f0;
+    --rec:#c93a55; --arc:#3268cf; --txt:#2c9457; --warn:#b07a10;
+    --shadow:0 1px 2px rgba(16,25,30,.05),0 8px 30px rgba(16,25,30,.06);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0d1012; --surface:#14181b; --surface-2:#191e21;
+    --ink:#e6ecee; --muted:#96a2ab; --faint:#68757d; --line:#242b2f;
+    --accent:#3fd0c3; --accent-ink:#8fe6dc; --accent-wash:#11302d;
+    --rec:#f0728a; --arc:#7aa6f0; --txt:#5ac488; --warn:#e0af4a;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--serif);font-size:1.02rem;line-height:1.72;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(var(--line) .5px,transparent .5px);
+    background-size:22px 22px;background-attachment:fixed;
+  }
+  ::selection{background:var(--accent-wash);color:var(--accent-ink)}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:0 clamp(18px,4vw,40px)}
+  .grid{display:grid;grid-template-columns:1fr;gap:0}
+  @media (min-width:980px){
+    .grid{grid-template-columns:216px minmax(0,1fr);gap:56px;align-items:start}
+  }
+
+  /* ---- eyebrows / labels ---- */
+  .eyebrow{
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--accent-ink);font-weight:600;
+  }
+  .mono{font-family:var(--mono)}
+
+  /* ---- hero ---- */
+  header.hero{padding:clamp(48px,9vw,104px) 0 40px}
+  .kicker{font-family:var(--mono);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;color:var(--faint)}
+  h1{
+    font-family:var(--sans);font-weight:760;letter-spacing:-.03em;line-height:1.02;
+    font-size:clamp(2.3rem,6vw,3.9rem);margin:.32em 0 .28em;text-wrap:balance;
+  }
+  h1 .live{color:var(--rec)}
+  .lede{font-size:clamp(1.08rem,2.2vw,1.32rem);color:var(--ink);max-width:34ch;margin:0}
+  .lede.wide{max-width:62ch;color:var(--muted);font-size:1.06rem;margin-top:1.1em}
+
+  .principles{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .principles span{
+    font-family:var(--mono);font-size:.74rem;color:var(--muted);
+    border:1px solid var(--line);border-radius:999px;padding:5px 12px;background:var(--surface);
+  }
+
+  /* ---- pipeline strip ---- */
+  .pipe-shell{margin-top:38px;border:1px solid var(--line);border-radius:14px;background:var(--surface);box-shadow:var(--shadow);overflow:hidden}
+  .pipe-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--surface-2)}
+  .pipe-head .eyebrow{color:var(--muted)}
+  .dotrow{display:flex;gap:6px}
+  .dotrow i{width:9px;height:9px;border-radius:50%;display:block}
+  .pipe-scroll{overflow-x:auto}
+  .pipe{display:flex;align-items:stretch;gap:0;min-width:640px;padding:20px 16px}
+  .stage{flex:1;min-width:120px;display:flex;flex-direction:column;gap:6px;padding:0 14px;position:relative}
+  .stage + .stage::before{content:"→";position:absolute;left:-9px;top:14px;color:var(--faint);font-family:var(--mono)}
+  .stage b{font-family:var(--sans);font-size:.95rem;letter-spacing:-.01em}
+  .stage small{color:var(--muted);font-size:.82rem;line-height:1.4;font-family:var(--sans)}
+  .stage .tag{font-family:var(--mono);font-size:.68rem;letter-spacing:.04em;color:var(--accent-ink)}
+  .branch{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 16px 20px;min-width:640px}
+  .branch .card{border:1px dashed var(--line);border-radius:10px;padding:12px 14px;background:var(--surface-2)}
+  .branch .card b{font-family:var(--sans);font-size:.9rem;display:flex;align-items:center;gap:7px}
+  .branch .card small{display:block;color:var(--muted);font-size:.82rem;font-family:var(--sans);margin-top:3px}
+  .swatch{width:9px;height:9px;border-radius:2px;display:inline-block}
+
+  /* ---- toc ---- */
+  nav.toc{display:none}
+  @media (min-width:980px){
+    nav.toc{display:block;position:sticky;top:28px;font-family:var(--mono);font-size:.78rem}
+    nav.toc .eyebrow{display:block;margin-bottom:14px}
+    nav.toc a{display:flex;gap:10px;color:var(--muted);text-decoration:none;padding:4px 0;line-height:1.35;border-radius:4px}
+    nav.toc a:hover{color:var(--accent-ink)}
+    nav.toc a .n{color:var(--faint);min-width:1.4em}
+    nav.toc a:hover .n{color:var(--accent)}
+  }
+
+  /* ---- sections ---- */
+  main{padding-bottom:80px}
+  section{padding:40px 0;border-top:1px solid var(--line);scroll-margin-top:24px}
+  section:first-child{border-top:0}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:6px}
+  .sec-head .num{font-family:var(--mono);font-size:.8rem;color:var(--accent);font-weight:600}
+  h2{font-family:var(--sans);font-weight:720;letter-spacing:-.02em;font-size:clamp(1.42rem,3vw,1.9rem);margin:.1em 0 .3em;text-wrap:balance}
+  h3{font-family:var(--sans);font-weight:680;letter-spacing:-.01em;font-size:1.06rem;margin:1.6em 0 .3em}
+  p{margin:.7em 0;max-width:68ch}
+  a{color:var(--accent-ink);text-underline-offset:3px;text-decoration-thickness:1px}
+  strong{font-weight:700}
+
+  /* body lists */
+  .body ul{max-width:68ch;padding-left:0;list-style:none;margin:.6em 0}
+  .body ul li{position:relative;padding-left:1.35em;margin:.5em 0}
+  .body ul li::before{content:"▹";position:absolute;left:0;top:0;color:var(--accent);font-family:var(--mono)}
+  code{font-family:var(--mono);font-size:.85em;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:.08em .38em;color:var(--ink)}
+
+  /* status legend */
+  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
+  .pill{font-family:var(--mono);font-size:.74rem;letter-spacing:.02em;border-radius:999px;padding:5px 12px;border:1px solid;display:inline-flex;align-items:center;gap:7px;background:var(--surface)}
+  .pill i{width:8px;height:8px;border-radius:50%}
+  .pill.rec{color:var(--rec);border-color:color-mix(in srgb,var(--rec) 40%,var(--line))}
+  .pill.rec i{background:var(--rec)}
+  .pill.arc{color:var(--arc);border-color:color-mix(in srgb,var(--arc) 40%,var(--line))}
+  .pill.arc i{background:var(--arc)}
+  .pill.txt{color:var(--txt);border-color:color-mix(in srgb,var(--txt) 40%,var(--line))}
+  .pill.txt i{background:var(--txt)}
+  .pill.acc{color:var(--accent-ink);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+  .pill.acc i{background:var(--accent)}
+
+  /* requirement cards */
+  .reqs{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;margin-top:22px}
+  .req{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:15px 16px;box-shadow:var(--shadow)}
+  .req .rk{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--accent-ink)}
+  .req b{display:block;font-family:var(--sans);font-weight:680;font-size:.98rem;margin:.35em 0 .3em;letter-spacing:-.01em}
+  .req p{font-family:var(--sans);font-size:.86rem;color:var(--muted);margin:0;line-height:1.5;max-width:none}
+  .req .target{display:inline-block;margin-top:8px;font-family:var(--mono);font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--warn);border:1px solid color-mix(in srgb,var(--warn) 40%,var(--line));border-radius:5px;padding:1px 6px}
+
+  /* invariants */
+  .invs{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-top:20px;counter-reset:inv}
+  .inv{position:relative;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;background:var(--surface);padding:14px 16px 14px 46px}
+  .inv::before{counter-increment:inv;content:counter(inv,decimal-leading-zero);position:absolute;left:14px;top:14px;font-family:var(--mono);font-size:.8rem;color:var(--accent);font-weight:600}
+  .inv b{font-family:var(--sans);font-weight:680;font-size:.94rem;display:block;letter-spacing:-.01em}
+  .inv small{font-family:var(--sans);color:var(--muted);font-size:.84rem;line-height:1.5;display:block;margin-top:2px}
+
+  /* data model */
+  .model{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-top:20px}
+  .ent{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:12px 14px}
+  .ent b{font-family:var(--mono);font-size:.82rem;color:var(--accent-ink);letter-spacing:-.01em}
+  .ent small{display:block;font-family:var(--sans);color:var(--muted);font-size:.82rem;line-height:1.45;margin-top:3px}
+
+  /* non-goals + glossary */
+  .split{display:grid;grid-template-columns:1fr;gap:10px;margin-top:18px}
+  .neg{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:13px 15px;display:flex;gap:11px;align-items:flex-start}
+  .neg .x{font-family:var(--mono);color:var(--rec);font-weight:700;line-height:1.5}
+  .neg p{margin:0;font-family:var(--sans);font-size:.9rem;color:var(--muted);max-width:none}
+  .neg p b{color:var(--ink);font-family:var(--sans)}
+
+  .gloss{border-top:1px solid var(--line);margin-top:8px}
+  .gloss dl{display:grid;grid-template-columns:1fr;gap:0;margin:0}
+  @media(min-width:640px){.gloss dl{grid-template-columns:auto 1fr;column-gap:22px}}
+  .gloss dt{font-family:var(--mono);font-size:.82rem;color:var(--accent-ink);padding:9px 0 0;font-weight:600}
+  .gloss dd{margin:0;font-family:var(--sans);font-size:.9rem;color:var(--muted);padding:9px 0;border-bottom:1px solid var(--line)}
+  @media(min-width:640px){.gloss dt{border-bottom:1px solid var(--line);padding-bottom:9px}}
+
+  /* roadmap */
+  .road{display:grid;grid-template-columns:1fr;gap:10px;margin-top:18px}
+  @media(min-width:720px){.road{grid-template-columns:1fr 1fr}}
+  .lane{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:15px 17px}
+  .lane .eyebrow{color:var(--accent-ink)}
+  .lane ul{list-style:none;padding:0;margin:.7em 0 0}
+  .lane li{font-family:var(--sans);font-size:.88rem;color:var(--muted);padding:3px 0 3px 1.2em;position:relative}
+  .lane li::before{content:"·";position:absolute;left:.2em;color:var(--accent);font-weight:700}
+
+  footer{border-top:1px solid var(--line);padding:30px 0 60px;color:var(--faint);font-family:var(--mono);font-size:.76rem;display:flex;flex-wrap:wrap;gap:6px 20px;justify-content:space-between}
+
+  .theme-btn{position:fixed;top:16px;right:16px;z-index:20;font-family:var(--mono);font-size:.72rem;letter-spacing:.05em;
+    background:var(--surface);color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:7px 13px;cursor:pointer;box-shadow:var(--shadow)}
+  .theme-btn:hover{color:var(--accent-ink);border-color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+</style>
+
+<button class="theme-btn" id="themeBtn" aria-label="Toggle colour theme">◐ theme</button>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="kicker">Product &amp; Functional Specification · v1</div>
+    <h1>TikTok Live&nbsp;Recorder<span class="live">.</span></h1>
+    <p class="lede">Watch a list of creators. Catch every stream the moment it starts. Never lose a recording. Make all of it searchable.</p>
+    <p class="lede wide">A self-hosted fleet that records live streams across many machines, archives the video to cheap cloud storage, transcribes the audio to timestamped text, and captures the live chat alongside — with no babysitting.</p>
+
+    <div class="principles" aria-label="Design principles">
+      <span>never lose the only copy</span>
+      <span>automatic by default</span>
+      <span>one operator · many machines</span>
+      <span>degrade, don't fail</span>
+      <span>the UI is the interface</span>
+    </div>
+
+    <div class="pipe-shell" aria-label="Pipeline at a glance">
+      <div class="pipe-head">
+        <span class="eyebrow">Pipeline · fully automatic</span>
+        <span class="dotrow"><i style="background:var(--rec)"></i><i style="background:var(--arc)"></i><i style="background:var(--txt)"></i></span>
+      </div>
+      <div class="pipe-scroll">
+        <div class="pipe">
+          <div class="stage"><span class="tag">01 · detect</span><b>Creator goes live</b><small>A watcher polls and catches the stream starting.</small></div>
+          <div class="stage"><span class="tag">02 · record</span><b>Recorder captures</b><small>Fast lossless remux to <span class="mono">TK_&lt;user&gt;_&lt;ts&gt;.mp4</span>.</small></div>
+          <div class="stage"><span class="tag">03 · fan out</span><b>Two paths split</b><small>Durable video &amp; searchable transcript, in parallel.</small></div>
+        </div>
+      </div>
+      <div class="branch">
+        <div class="card"><b><span class="swatch" style="background:var(--arc)"></span>Video path</b><small>Moved to storage and/or straight to cloud archive — verified, then the local copy is dropped.</small></div>
+        <div class="card"><b><span class="swatch" style="background:var(--txt)"></span>Transcript path</b><small>Whisper → timestamped text → full-text index. Chat captured live, matched &amp; indexed.</small></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <nav class="toc" aria-label="Contents">
+      <span class="eyebrow">Contents</span>
+      <a href="#purpose"><span class="n">01</span> Purpose &amp; vision</a>
+      <a href="#actors"><span class="n">02</span> Actors &amp; roles</a>
+      <a href="#pipeline"><span class="n">03</span> The pipeline</a>
+      <a href="#requirements"><span class="n">04</span> Functional requirements</a>
+      <a href="#invariants"><span class="n">05</span> Invariants</a>
+      <a href="#model"><span class="n">06</span> Data model</a>
+      <a href="#nongoals"><span class="n">07</span> Non-goals</a>
+      <a href="#roadmap"><span class="n">08</span> Roadmap</a>
+      <a href="#glossary"><span class="n">09</span> Glossary</a>
+    </nav>
+
+    <main class="body">
+      <section id="purpose">
+        <div class="sec-head"><span class="num">§01</span><span class="eyebrow">Why it exists</span></div>
+        <h2>Purpose &amp; vision</h2>
+        <p>Live streams are ephemeral — they vanish when the creator ends them. This system's job is to <strong>monitor a watchlist of TikTok creators, record their live streams the instant they go live, and turn every recording into durable, searchable content</strong>: video safely archived, audio transcribed to timestamped text, and live chat captured alongside.</p>
+        <p>It is built for a <strong>single operator running a self-hosted fleet</strong> of cheap machines, driven entirely from one web interface. The machines are cattle, not pets. The three promises are simple: <strong>never miss a stream, never lose a recording, make the archive instantly searchable</strong>.</p>
+      </section>
+
+      <section id="actors">
+        <div class="sec-head"><span class="num">§02</span><span class="eyebrow">Who &amp; what</span></div>
+        <h2>Actors &amp; roles</h2>
+        <div class="model">
+          <div class="ent"><b>Operator</b><small>The single human owner. Manages the watchlist, storage, and archive; reads transcripts.</small></div>
+          <div class="ent"><b>Control plane</b><small>The brain: source-of-truth database, orchestration of every transfer, and the web UI.</small></div>
+          <div class="ent"><b>Recorder backend</b><small>A machine that watches assigned creators and records their streams.</small></div>
+          <div class="ent"><b>Storage / transcription</b><small>A machine that stores video, transcribes with Whisper, and pushes to cloud.</small></div>
+          <div class="ent"><b>Cloud archive</b><small>An external object store (any rclone remote) holding the durable copy of the video.</small></div>
+          <div class="ent"><b>Creator</b><small>A watched TikTok user — the subject of recording, not a system user.</small></div>
+        </div>
+      </section>
+
+      <section id="pipeline">
+        <div class="sec-head"><span class="num">§03</span><span class="eyebrow">End to end</span></div>
+        <h2>The pipeline</h2>
+        <p>Every recording moves through the same states, and the operator sees each one live, per recording:</p>
+        <div class="legend">
+          <span class="pill rec"><i></i>recording</span>
+          <span class="pill arc"><i></i>on storage / archived</span>
+          <span class="pill txt"><i></i>transcript available</span>
+          <span class="pill acc"><i></i>searchable</span>
+        </div>
+        <p>When a creator goes live, the recorder captures the stream to a per-creator file. When it ends, the file is finalised and <strong>fans out into two independent paths</strong>: the video is moved to durable storage (a storage box and/or the cloud, always verified before the local copy is deleted), and the audio is transcribed and folded into a search index. If chat capture is on, comments, gifts, and likes are logged during the live and indexed too.</p>
+      </section>
+
+      <section id="requirements">
+        <div class="sec-head"><span class="num">§04</span><span class="eyebrow">What it must do</span></div>
+        <h2>Functional requirements</h2>
+        <p>Eleven areas. Items marked <span class="req"><span class="target" style="margin:0">target</span></span> are intended direction, not yet built.</p>
+        <div class="reqs">
+          <div class="req"><span class="rk">4.1</span><b>Watchlist</b><p>Add / remove creators by username, per-creator poll interval and chat toggle, auto or manual backend assignment, and safe migration between backends that never records a creator twice.</p></div>
+          <div class="req"><span class="rk">4.2</span><b>Recording</b><p>Fast lossless remux, recovery of interrupted recordings, and an absolute rule: a file still being written is never touched by anything downstream.</p></div>
+          <div class="req"><span class="rk">4.3</span><b>Video durability &amp; archive</b><p>Every recording reaches ≥1 verified durable location before its local copy can be dropped. Any rclone cloud, retention &amp; disk-pressure eviction, and playback that works after the local copy is gone.</p></div>
+          <div class="req"><span class="rk">4.4</span><b>Transcription</b><p>Timestamped transcripts via Whisper; salvage of corrupt/truncated recordings; optional audio-first mode so the full video bypasses the transcription box; on-demand re-transcription.</p></div>
+          <div class="req"><span class="rk">4.5</span><b>Chat capture</b><p>Comments, gifts and likes logged during the live, matched to their recording and full-text indexed. One-click fix when dependencies are missing.</p></div>
+          <div class="req"><span class="rk">4.6</span><b>Search &amp; catalog</b><p>One fast, local full-text search across all transcripts <em>and</em> chat, with filters and snippets. The Files view is catalog-backed, not a per-keystroke fan-out.</p></div>
+          <div class="req"><span class="rk">4.7</span><b>Playback &amp; viewing</b><p>Transcript viewer and video player. <span class="target">target</span> — synced playback: click a line to seek, the current line follows, search jumps the player.</p></div>
+          <div class="req"><span class="rk">4.8</span><b>Cookies</b><p>Stored per backend, applied without restart, viewable at a glance across the fleet with set/missing status. <span class="target">target</span> — detect likely-expired cookies and alert.</p></div>
+          <div class="req"><span class="rk">4.9</span><b>Alerts</b><p>Proactive ops notifications — disk filling, box unreachable, watchers in error, transcription give-ups, archive failures — over webhook / ntfy / Slack. <span class="target">target</span> — content notifications (“live now”, “transcript ready”).</p></div>
+          <div class="req"><span class="rk">4.10</span><b>Fleet ops &amp; deploy</b><p>One-click provision and update over SSH; update detection by build id; deploys robust to file ownership; machine identity is <code>ssh_host:port</code>, so NAT’d boxes and colocation are handled correctly.</p></div>
+          <div class="req"><span class="rk">4.11</span><b>Cost &amp; capacity <span class="target">target</span></b><p>One view of total stored, growth rate, days-to-full per box, and estimated monthly cloud cost per creator — so retention is a data-driven decision.</p></div>
+        </div>
+      </section>
+
+      <section id="invariants">
+        <div class="sec-head"><span class="num">§05</span><span class="eyebrow">Always true</span></div>
+        <h2>Cross-cutting invariants</h2>
+        <p>Rules that override every optimisation. If a change would break one of these, the change is wrong.</p>
+        <div class="invs">
+          <div class="inv"><b>No data loss</b><small>A file is deleted from a location only after verified presence elsewhere. A smaller/truncated remote copy does not count.</small></div>
+          <div class="inv"><b>No duplicate recording</b><small>A creator is recorded by exactly one backend at a time. Migrations preserve this or refuse.</small></div>
+          <div class="inv"><b>No double transcription</b><small>Each recording is transcribed once. Audio-first must not cause a box to also auto-transcribe the same video.</small></div>
+          <div class="inv"><b>In-progress is sacrosanct</b><small>Never transfer, transcribe, evict, or delete a file that is still being written.</small></div>
+          <div class="inv"><b>Secrets never leak</b><small>Cookies, tokens and archive credentials never reach logs, transcripts, commit history, or plaintext config on a box.</small></div>
+          <div class="inv"><b>Failures stay local</b><small>One bad file, box, or creator degrades only itself — never stalls or crashes the pipeline for the rest.</small></div>
+          <div class="inv"><b>The UI can't be bricked</b><small>A front-end error must not disable navigation or hide state. The operator always has a working way to see and fix the fleet.</small></div>
+        </div>
+      </section>
+
+      <section id="model">
+        <div class="sec-head"><span class="num">§06</span><span class="eyebrow">Conceptual entities</span></div>
+        <h2>Data model</h2>
+        <div class="model">
+          <div class="ent"><b>Backend</b><small>A recorder machine: identity, URL, auth, health, machine key.</small></div>
+          <div class="ent"><b>Watcher</b><small>A creator on the list: backend, interval, chat flag, live state.</small></div>
+          <div class="ent"><b>Storage server</b><small>A storage/transcription machine: health, disk, archive config.</small></div>
+          <div class="ent"><b>Recording</b><small>A captured stream — the catalog’s primary entity.</small></div>
+          <div class="ent"><b>Blob location</b><small>Where a recording’s bytes live: tier, box/remote, verified size.</small></div>
+          <div class="ent"><b>Transcript</b><small>Status (none→done, salvaged, gave-up) and indexed text.</small></div>
+          <div class="ent"><b>Chat log</b><small>A captured chat stream, matched to a recording, indexed.</small></div>
+          <div class="ent"><b>Transfer</b><small>The ledger of moving a file — the basis of retry &amp; recovery.</small></div>
+          <div class="ent"><b>Disk sample</b><small>Periodic free/total per box, for fill-rate forecasting.</small></div>
+        </div>
+      </section>
+
+      <section id="nongoals">
+        <div class="sec-head"><span class="num">§07</span><span class="eyebrow">Deliberately out of scope</span></div>
+        <h2>Non-goals</h2>
+        <div class="split">
+          <div class="neg"><span class="x">✕</span><p><b>Not a multi-tenant SaaS.</b> One operator, one trust boundary. Read-only viewer accounts are a possible future extension, not a core goal.</p></div>
+          <div class="neg"><span class="x">✕</span><p><b>Not an editing suite.</b> Recording is a fast remux; clip-cutting and highlights are optional add-ons, not the core.</p></div>
+          <div class="neg"><span class="x">✕</span><p><b>Not a broader TikTok client.</b> It does only what recording and chat capture require — no posting, interacting, or profile scraping.</p></div>
+          <div class="neg"><span class="x">✕</span><p><b>Not responsible for legality.</b> The system provides the mechanism; how it’s used is the operator’s responsibility.</p></div>
+        </div>
+      </section>
+
+      <section id="roadmap">
+        <div class="sec-head"><span class="num">§08</span><span class="eyebrow">Where it grows</span></div>
+        <h2>Roadmap themes</h2>
+        <div class="road">
+          <div class="lane"><span class="eyebrow">Rebuilt pipeline</span><ul><li>Recorder → cloud video, direct</li><li>Recorder → small audio → transcriber</li><li>Fixes-on-failure → catalog</li><li>Audio-first is phase one</li></ul></div>
+          <div class="lane"><span class="eyebrow">Smarter coverage</span><ul><li>Adaptive polling from live-time history</li><li>Cookie-expiry detection</li><li>Orphaned-watcher reconciler</li></ul></div>
+          <div class="lane"><span class="eyebrow">Content value</span><ul><li>Synced transcript / video player</li><li>Auto-highlights from chat surges</li><li>Per-creator coverage timeline</li></ul></div>
+          <div class="lane"><span class="eyebrow">Cost &amp; scale</span><ul><li>Storage / cost forecasting</li><li>Least-recording backend placement</li><li>Bulk “drain a backend”</li></ul></div>
+        </div>
+      </section>
+
+      <section id="glossary">
+        <div class="sec-head"><span class="num">§09</span><span class="eyebrow">Terms</span></div>
+        <h2>Glossary</h2>
+        <div class="gloss">
+          <dl>
+            <dt>Control plane</dt><dd>The orchestrating web app plus source-of-truth database.</dd>
+            <dt>Backend</dt><dd>A machine that records creators.</dd>
+            <dt>Storage box</dt><dd>A machine that stores video and/or transcribes.</dd>
+            <dt>Archive</dt><dd>The external cloud remote (rclone) holding durable video.</dd>
+            <dt>Catalog</dt><dd>The database of recordings, transcripts, chat, and locations.</dd>
+            <dt>Audio-first</dt><dd>Transcribing from a small extracted audio track, not the full video.</dd>
+            <dt>Salvage</dt><dd>Recovering a transcript from a corrupt or truncated recording.</dd>
+            <dt>Eviction</dt><dd>Deleting a local copy after it’s verified present on the remote.</dd>
+            <dt>Colocation</dt><dd>Recorder and storage roles running on one machine.</dd>
+            <dt>Machine identity</dt><dd><span class="mono">ssh_host:port</span> — distinguishes boxes behind one NAT’d IP.</dd>
+          </dl>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<footer class="wrap">
+  <span>TikTok Live Recorder — living spec</span>
+  <span>describes intent, not implementation</span>
+</footer>
+
+<script>
+  (function(){
+    var btn=document.getElementById('themeBtn');
+    var root=document.documentElement;
+    function cur(){
+      var s=root.getAttribute('data-theme');
+      if(s) return s;
+      return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+    }
+    btn.addEventListener('click',function(){
+      var next=cur()==='dark'?'light':'dark';
+      root.setAttribute('data-theme',next);
+      btn.textContent=(next==='dark'?'☾':'☀')+' theme';
+    });
+  })();
+</script>
